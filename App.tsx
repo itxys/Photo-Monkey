@@ -32,21 +32,29 @@ import {
   Check,
   X,
   GripVertical,
-  Fingerprint
+  Fingerprint,
+  Undo2,
+  Redo2,
+  Type as TypeIcon,
+  Search,
+  Square,
+  Wand2,
+  Spline,
+  Hexagon
 } from 'lucide-react';
 import { ToolType, Layer, BlendMode, BrushPreset } from './types';
 import { gemini } from './services/geminiService';
 import { translations, Language } from './i18n';
+import { parseAbr } from './utils/abrParser';
 
-// HSL color conversion utilities for Hue/Saturation adjustment
+const MAX_HISTORY_STEPS = 30;
+
+// HSL color conversion utilities
 const rgbToHsl = (r: number, g: number, b: number): [number, number, number] => {
   r /= 255; g /= 255; b /= 255;
   const max = Math.max(r, g, b), min = Math.min(r, g, b);
   let h = 0, s, l = (max + min) / 2;
-
-  if (max === min) {
-    h = s = 0; // achromatic
-  } else {
+  if (max === min) { h = s = 0; } else {
     const d = max - min;
     s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
     switch (max) {
@@ -62,13 +70,9 @@ const rgbToHsl = (r: number, g: number, b: number): [number, number, number] => 
 const hslToRgb = (h: number, s: number, l: number): [number, number, number] => {
   h /= 360; s /= 100; l /= 100;
   let r, g, b;
-
-  if (s === 0) {
-    r = g = b = l; // achromatic
-  } else {
+  if (s === 0) { r = g = b = l; } else {
     const hue2rgb = (p: number, q: number, t: number) => {
-      if (t < 0) t += 1;
-      if (t > 1) t -= 1;
+      if (t < 0) t += 1; if (t > 1) t -= 1;
       if (t < 1/6) return p + (q - p) * 6 * t;
       if (t < 1/2) return q;
       if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
@@ -76,22 +80,13 @@ const hslToRgb = (h: number, s: number, l: number): [number, number, number] => 
     };
     const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
     const p = 2 * l - q;
-    r = hue2rgb(p, q, h + 1/3);
-    g = hue2rgb(p, q, h);
-    b = hue2rgb(p, q, h - 1/3);
+    r = hue2rgb(p, q, h + 1/3); g = hue2rgb(p, q, h); b = hue2rgb(p, q, h - 1/3);
   }
   return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
 };
 
-interface Guide {
-  id: string;
-  type: 'h' | 'v';
-  pos: number; 
-}
-
-interface ShortcutMap {
-  [actionId: string]: string;
-}
+interface Guide { id: string; type: 'h' | 'v'; pos: number; }
+interface ShortcutMap { [actionId: string]: string; }
 
 const DEFAULT_SHORTCUTS: ShortcutMap = {
   'TOOL_MOVE': 'v',
@@ -101,13 +96,17 @@ const DEFAULT_SHORTCUTS: ShortcutMap = {
   'TOOL_FILL': 'g',
   'TOOL_PICKER': 'i',
   'TOOL_HAND': 'h',
+  'TOOL_TEXT': 't',
   'MENU_NEW': 'Control+n',
   'MENU_SAVE': 'Control+s',
   'MENU_EXPORT': 'Control+Alt+s',
   'ZOOM_IN': 'Control+=',
   'ZOOM_OUT': 'Control+-',
   'FIT_SCREEN': 'Control+0',
-  'TOGGLE_RULERS': 'Control+r'
+  'TOGGLE_RULERS': 'Control+r',
+  'UNDO': 'Control+z',
+  'REDO': 'Control+y',
+  'DESELECT': 'Control+d'
 };
 
 const App: React.FC = () => {
@@ -125,17 +124,36 @@ const App: React.FC = () => {
   });
   const [showShortcutsModal, setShowShortcutsModal] = useState(false);
 
-  // Brush Settings
+  // Tool States
   const [activeTool, setActiveTool] = useState<ToolType>(ToolType.BRUSH);
   const [prevToolBeforeAlt, setPrevToolBeforeAlt] = useState<ToolType | null>(null);
+  
+  // Brush Settings
   const [brushSize, setBrushSize] = useState(40);
   const [brushColor, setBrushColor] = useState('#ffffff');
   const [brushOpacity, setBrushOpacity] = useState(1);
   const [brushSmoothing, setBrushSmoothing] = useState(0.4);
   const [brushSpacing, setBrushSpacing] = useState(0.1);
   const [brushHardness, setBrushHardness] = useState(0.8);
+  const [brushRotation, setBrushRotation] = useState(0);
   const [fillTolerance, setFillTolerance] = useState(30);
   const [smudgeStrength, setSmudgeStrength] = useState(0.5);
+
+  // Brush Library UI States
+  const [brushSearchTerm, setBrushSearchTerm] = useState('');
+
+  // Selection States
+  const [selectionActive, setSelectionActive] = useState(false);
+  const [selectionPath, setSelectionPath] = useState<{ x: number, y: number }[]>([]);
+  const [polyLassoPath, setPolyLassoPath] = useState<{ x: number, y: number }[]>([]);
+  const selectionCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const marchingAntsOffset = useRef(0);
+
+  // Text Settings
+  const [textFontSize, setTextFontSize] = useState(48);
+  const [textFontFamily, setTextFontFamily] = useState('sans-serif');
+  const [textInput, setTextInput] = useState<{ x: number, y: number } | null>(null);
+  const [currentTextValue, setCurrentTextValue] = useState('');
   
   // Brush Library
   const [brushPresets, setBrushPresets] = useState<BrushPreset[]>([
@@ -146,6 +164,10 @@ const App: React.FC = () => {
   const [activeBrushId, setActiveBrushId] = useState('round');
   const [showBrushLib, setShowBrushLib] = useState(false);
   const [draggedBrushIdx, setDraggedBrushIdx] = useState<number | null>(null);
+
+  const filteredBrushPresets = useMemo(() => {
+    return brushPresets.filter(bp => bp.name.toLowerCase().includes(brushSearchTerm.toLowerCase()));
+  }, [brushPresets, brushSearchTerm]);
 
   // App States
   const [layers, setLayers] = useState<Layer[]>([]);
@@ -160,6 +182,10 @@ const App: React.FC = () => {
   const [zoom, setZoom] = useState(0.8);
   const [canvasOffset, setCanvasOffset] = useState({ x: 0, y: 0 });
   const [isSpacePressed, setIsSpacePressed] = useState(false);
+
+  // History State
+  const [history, setHistory] = useState<Layer[][]>([]);
+  const [redoStack, setRedoStack] = useState<Layer[][]>([]);
 
   // Rulers & Guides
   const [showRulers, setShowRulers] = useState(true);
@@ -193,13 +219,51 @@ const App: React.FC = () => {
   const workspaceColorRef = useRef<HTMLInputElement>(null);
   const [targetIconBrushId, setTargetIconBrushId] = useState<string | null>(null);
 
-  const addNewLayer = useCallback((name?: string) => {
+  // Deep clone a layer list (clones canvases)
+  const cloneLayers = useCallback((layerList: Layer[]): Layer[] => {
+    return layerList.map(layer => {
+      const newCanvas = document.createElement('canvas');
+      newCanvas.width = layer.canvas.width;
+      newCanvas.height = layer.canvas.height;
+      const newCtx = newCanvas.getContext('2d', { willReadFrequently: true })!;
+      newCtx.drawImage(layer.canvas, 0, 0);
+      return { ...layer, canvas: newCanvas, ctx: newCtx };
+    });
+  }, []);
+
+  const pushToHistory = useCallback(() => {
+    setHistory(prev => {
+      const newHistory = [...prev, cloneLayers(layers)];
+      if (newHistory.length > MAX_HISTORY_STEPS) newHistory.shift();
+      return newHistory;
+    });
+    setRedoStack([]);
+  }, [layers, cloneLayers]);
+
+  const undo = useCallback(() => {
+    if (history.length === 0) return;
+    const previous = history[history.length - 1];
+    setRedoStack(prev => [cloneLayers(layers), ...prev]);
+    setHistory(prev => prev.slice(0, -1));
+    setLayers(cloneLayers(previous));
+  }, [history, layers, cloneLayers]);
+
+  const redo = useCallback(() => {
+    if (redoStack.length === 0) return;
+    const next = redoStack[0];
+    setHistory(prev => [...prev, cloneLayers(layers)]);
+    setRedoStack(prev => prev.slice(1));
+    setLayers(cloneLayers(next));
+  }, [redoStack, layers, cloneLayers]);
+
+  const addNewLayer = useCallback((name?: string, isText: boolean = false) => {
+    if (layers.length > 0) pushToHistory();
     const canvas = document.createElement('canvas');
     canvas.width = canvasSize.width;
     canvas.height = canvasSize.height;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return;
-    if (layers.length === 0) {
+    if (!ctx) return null;
+    if (layers.length === 0 && !isText) {
       ctx.fillStyle = canvasBgColor;
       ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
     }
@@ -215,7 +279,8 @@ const App: React.FC = () => {
     };
     setLayers(prev => [newLayer, ...prev]);
     setActiveLayerId(newLayer.id);
-  }, [canvasSize, canvasBgColor, layers.length, t]);
+    return newLayer;
+  }, [canvasSize, canvasBgColor, layers, t, pushToHistory]);
 
   const handleFitScreen = useCallback(() => {
     if (!viewportRef.current) return;
@@ -254,7 +319,6 @@ const App: React.FC = () => {
     link.click();
   };
 
-  // Fix: Implement missing handleExportSelectedLayer function
   const handleExportSelectedLayer = useCallback(() => {
     const active = layers.find(l => l.id === activeLayerId);
     if (!active) return;
@@ -264,45 +328,126 @@ const App: React.FC = () => {
     link.click();
   }, [activeLayerId, layers]);
 
-  // Fix: Implement missing handleWheel function
-  const handleWheel = (e: React.WheelEvent) => {
-    if (e.ctrlKey || e.metaKey) {
-      const zoomSpeed = 0.001;
-      const delta = -e.deltaY * zoomSpeed;
-      setZoom(prev => Math.max(0.1, Math.min(5, prev + delta)));
-    } else {
-      setCanvasOffset(prev => ({
-        x: prev.x - e.deltaX,
-        y: prev.y - e.deltaY
-      }));
+  // --- Selection Marquee Logic ---
+  const drawSelection = useCallback((ctx: CanvasRenderingContext2D, path: { x: number, y: number }[], tool: ToolType) => {
+    if (path.length < 2 && tool !== ToolType.SELECT_WAND) return;
+    ctx.clearRect(0, 0, canvasSize.width, canvasSize.height);
+    ctx.beginPath();
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.lineDashOffset = marchingAntsOffset.current;
+
+    if (tool === ToolType.SELECT_RECT) {
+      const start = path[0], end = path[path.length - 1];
+      ctx.rect(start.x, start.y, end.x - start.x, end.y - start.y);
+    } else if (tool === ToolType.SELECT_ELLIPSE) {
+      const start = path[0], end = path[path.length - 1];
+      const cx = (start.x + end.x) / 2, cy = (start.y + end.y) / 2;
+      const rx = Math.abs(end.x - start.x) / 2, ry = Math.abs(end.y - start.y) / 2;
+      ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+    } else if (tool === ToolType.SELECT_LASSO || tool === ToolType.SELECT_POLY_LASSO) {
+      ctx.moveTo(path[0].x, path[0].y);
+      path.forEach(p => ctx.lineTo(p.x, p.y));
+      ctx.closePath();
+    } else if (tool === ToolType.SELECT_WAND) {
+        // Wand selection rendering would require a mask-to-path conversion
+        // Simplified: filling with semi-transparent color if wand active
+        ctx.fillStyle = 'rgba(255, 165, 0, 0.2)';
+        ctx.fill();
     }
-  };
+    ctx.stroke();
+    
+    // Second stroke for contrast
+    ctx.strokeStyle = '#fff';
+    ctx.lineDashOffset = marchingAntsOffset.current + 4;
+    ctx.stroke();
+  }, [canvasSize]);
+
+  // Magic Wand Tool implementation
+  const runMagicWand = useCallback((startX: number, startY: number) => {
+    const active = getActiveLayer();
+    if (!active) return;
+    const { width, height } = canvasSize;
+    const imgData = active.ctx.getImageData(0, 0, width, height);
+    const data = imgData.data;
+    const x = Math.floor(startX), y = Math.floor(startY);
+    const targetIdx = (y * width + x) * 4;
+    const targetR = data[targetIdx], targetG = data[targetIdx + 1], targetB = data[targetIdx + 2], targetA = data[targetIdx + 3];
+
+    const visited = new Uint8Array(width * height);
+    const stack: [number, number][] = [[x, y]];
+    const selectionMask = document.createElement('canvas');
+    selectionMask.width = width; selectionMask.height = height;
+    const smCtx = selectionMask.getContext('2d')!;
+    const smData = smCtx.createImageData(width, height);
+
+    while (stack.length > 0) {
+      const [currX, currY] = stack.pop()!;
+      if (currX < 0 || currX >= width || currY < 0 || currY >= height) continue;
+      const idx = currY * width + currX;
+      if (visited[idx]) continue;
+      visited[idx] = 1;
+
+      const pxIdx = idx * 4;
+      const dr = Math.abs(data[pxIdx] - targetR), dg = Math.abs(data[pxIdx + 1] - targetG), db = Math.abs(data[pxIdx + 2] - targetB), da = Math.abs(data[pxIdx + 3] - targetA);
+      if (dr <= fillTolerance && dg <= fillTolerance && db <= fillTolerance && da <= fillTolerance) {
+        smData.data[pxIdx + 3] = 255; // mark selected in alpha channel
+        stack.push([currX + 1, currY], [currX - 1, currY], [currX, currY + 1], [currX, currY - 1]);
+      }
+    }
+    smCtx.putImageData(smData, 0, 0);
+    // Draw magic wand mask onto selection layer
+    if (selectionCanvasRef.current) {
+        const sCtx = selectionCanvasRef.current.getContext('2d')!;
+        sCtx.clearRect(0, 0, width, height);
+        sCtx.globalAlpha = 0.3;
+        sCtx.fillStyle = '#ffa500';
+        sCtx.drawImage(selectionMask, 0, 0);
+        sCtx.globalAlpha = 1.0;
+        setSelectionActive(true);
+    }
+  }, [canvasSize, fillTolerance, activeLayerId]);
+
+  // Selection "Marching Ants" animation
+  useEffect(() => {
+    let anim: number;
+    const loop = () => {
+      marchingAntsOffset.current = (marchingAntsOffset.current + 0.5) % 8;
+      if (selectionActive && selectionCanvasRef.current && selectionPath.length >= 2) {
+        drawSelection(selectionCanvasRef.current.getContext('2d')!, selectionPath, activeTool);
+      }
+      anim = requestAnimationFrame(loop);
+    };
+    anim = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(anim);
+  }, [selectionActive, selectionPath, activeTool, drawSelection]);
+
+  const deselect = useCallback(() => {
+    setSelectionActive(false);
+    setSelectionPath([]);
+    setPolyLassoPath([]);
+    if (selectionCanvasRef.current) {
+      selectionCanvasRef.current.getContext('2d')!.clearRect(0, 0, canvasSize.width, canvasSize.height);
+    }
+  }, [canvasSize]);
 
   // Shortcut Listener
   useEffect(() => {
     const handleKeyDownGlobal = (e: KeyboardEvent) => {
       if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
-
-      if (e.code === 'Space' && !isSpacePressed) {
-        setIsSpacePressed(true);
-      }
-
-      // Temporary Tool Switch (Alt for Picker)
+      if (e.code === 'Space' && !isSpacePressed) { setIsSpacePressed(true); }
       if (e.altKey && altForPickerEnabled && activeTool === ToolType.BRUSH && !prevToolBeforeAlt) {
         setPrevToolBeforeAlt(ToolType.BRUSH);
         setActiveTool(ToolType.PICKER);
         return;
       }
-
-      // Build key string
       const parts = [];
       if (e.ctrlKey || e.metaKey) parts.push('Control');
       if (e.altKey) parts.push('Alt');
       if (e.shiftKey) parts.push('Shift');
       if (!['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) parts.push(e.key.toLowerCase());
       const keyCombo = parts.join('+');
-
-      // Find action
       const action = Object.entries(shortcuts).find(([_, combo]) => combo === keyCombo)?.[0];
 
       if (action) {
@@ -315,38 +460,36 @@ const App: React.FC = () => {
           case 'TOOL_FILL': setActiveTool(ToolType.FILL); break;
           case 'TOOL_PICKER': setActiveTool(ToolType.PICKER); break;
           case 'TOOL_HAND': setActiveTool(ToolType.HAND); break;
+          case 'TOOL_TEXT': setActiveTool(ToolType.TEXT); break;
           case 'MENU_NEW': addNewLayer(); break;
           case 'MENU_SAVE': handleDownload(); break;
           case 'ZOOM_IN': handleZoomIn(); break;
           case 'ZOOM_OUT': handleZoomOut(); break;
           case 'FIT_SCREEN': handleFitScreen(); break;
           case 'TOGGLE_RULERS': setShowRulers(prev => !prev); break;
+          case 'UNDO': undo(); break;
+          case 'REDO': redo(); break;
+          case 'DESELECT': deselect(); break;
         }
       }
     };
-
     const handleKeyUpGlobal = (e: KeyboardEvent) => {
       if (e.code === 'Space') setIsSpacePressed(false);
-      
-      // Revert temporary tool switch
       if (e.key === 'Alt' && prevToolBeforeAlt) {
         setActiveTool(prevToolBeforeAlt);
         setPrevToolBeforeAlt(null);
       }
     };
-
     window.addEventListener('keydown', handleKeyDownGlobal);
     window.addEventListener('keyup', handleKeyUpGlobal);
     return () => {
       window.removeEventListener('keydown', handleKeyDownGlobal);
       window.removeEventListener('keyup', handleKeyUpGlobal);
     };
-  }, [shortcuts, isSpacePressed, addNewLayer, handleFitScreen, activeTool, prevToolBeforeAlt, altForPickerEnabled]);
+  }, [shortcuts, isSpacePressed, addNewLayer, handleFitScreen, activeTool, prevToolBeforeAlt, altForPickerEnabled, undo, redo, deselect]);
 
   useEffect(() => {
-    if (layers.length === 0) {
-      addNewLayer(t.layers.background);
-    }
+    if (layers.length === 0) { addNewLayer(t.layers.background); }
   }, []);
 
   const initiateRemoveLayer = (id: string) => {
@@ -357,6 +500,7 @@ const App: React.FC = () => {
 
   const executeRemoveLayer = () => {
     if (!layerToDeleteId) return;
+    pushToHistory();
     const id = layerToDeleteId;
     setLayers(prev => prev.filter(l => l.id !== id));
     if (activeLayerId === id) {
@@ -368,6 +512,7 @@ const App: React.FC = () => {
   };
 
   const updateLayerName = (id: string, newName: string) => {
+    pushToHistory();
     setLayers(prev => prev.map(l => l.id === id ? { ...l, name: newName || l.name } : l));
     setEditingLayerId(null);
   };
@@ -375,12 +520,13 @@ const App: React.FC = () => {
   const getActiveLayer = () => layers.find(l => l.id === activeLayerId);
 
   const executeResize = () => {
+    pushToHistory();
     const { width, height, bgColor } = tempCanvasSettings;
     const updatedLayers = layers.map(layer => {
       const newCanvas = document.createElement('canvas');
       newCanvas.width = width;
       newCanvas.height = height;
-      const newCtx = newCanvas.getContext('2d');
+      const newCtx = newCanvas.getContext('2d', { willReadFrequently: true });
       if (newCtx) {
         if (layer.name === t.layers.background) {
             newCtx.fillStyle = bgColor;
@@ -399,10 +545,8 @@ const App: React.FC = () => {
 
   const sampleColor = (x: number, y: number) => {
     const tempCanvas = document.createElement('canvas');
-    tempCanvas.width = 1;
-    tempCanvas.height = 1;
+    tempCanvas.width = 1; tempCanvas.height = 1;
     const tempCtx = tempCanvas.getContext('2d')!;
-    
     [...layers].reverse().forEach(layer => {
       if (layer.visible) {
         tempCtx.globalAlpha = layer.opacity;
@@ -410,7 +554,6 @@ const App: React.FC = () => {
         tempCtx.drawImage(layer.canvas, x, y, 1, 1, 0, 0, 1, 1);
       }
     });
-    
     const [r, g, b] = tempCtx.getImageData(0, 0, 1, 1).data;
     const hex = "#" + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
     setBrushColor(hex);
@@ -421,21 +564,16 @@ const App: React.FC = () => {
     const currentBrush = brushPresets.find(b => b.id === activeBrushId);
     const finalSize = size * (pressure + 0.2);
     const finalOpacity = opacity * (pressure + 0.2);
-
+    const rotationRad = (brushRotation * Math.PI) / 180;
     ctx.save();
     ctx.translate(x, y);
-
-    if (activeTool === ToolType.ERASER) {
-      ctx.globalCompositeOperation = 'destination-out';
-    } else {
-      ctx.globalCompositeOperation = 'source-over';
-    }
-
+    ctx.rotate(rotationRad);
+    if (activeTool === ToolType.ERASER) { ctx.globalCompositeOperation = 'destination-out'; } 
+    else { ctx.globalCompositeOperation = 'source-over'; }
     if (currentBrush?.image) {
       ctx.globalAlpha = finalOpacity;
       const offCanvas = document.createElement('canvas');
-      offCanvas.width = finalSize;
-      offCanvas.height = finalSize;
+      offCanvas.width = finalSize; offCanvas.height = finalSize;
       const offCtx = offCanvas.getContext('2d')!;
       offCtx.drawImage(currentBrush.image, 0, 0, finalSize, finalSize);
       offCtx.globalCompositeOperation = 'source-in';
@@ -448,45 +586,49 @@ const App: React.FC = () => {
       grad.addColorStop(0, rgba);
       grad.addColorStop(Math.min(0.99, brushHardness), rgba);
       grad.addColorStop(1, 'rgba(0,0,0,0)');
-      
       ctx.fillStyle = grad;
-      if (activeBrushId === 'square') {
-        ctx.fillRect(-finalSize / 2, -finalSize / 2, finalSize, finalSize);
-      } else {
-        ctx.beginPath();
-        ctx.arc(0, 0, finalSize / 2, 0, Math.PI * 2);
-        ctx.fill();
-      }
+      if (activeBrushId === 'square') { ctx.fillRect(-finalSize / 2, -finalSize / 2, finalSize, finalSize); } 
+      else { ctx.beginPath(); ctx.arc(0, 0, finalSize / 2, 0, Math.PI * 2); ctx.fill(); }
     }
     ctx.restore();
   };
 
-  // Smudge logic
   const paintSmudge = (ctx: CanvasRenderingContext2D, x: number, y: number, size: number, pressure: number) => {
     if (!smudgeBuffer.current) return;
     const finalSize = size * (pressure + 0.2);
     const strength = smudgeStrength * (pressure + 0.5);
-
+    const rotationRad = (brushRotation * Math.PI) / 180;
     ctx.save();
     ctx.globalAlpha = Math.min(strength, 1.0);
-    
-    // Draw the sampled buffer back onto current position
-    // We use a clip to simulate the brush shape
+    ctx.translate(x, y);
+    ctx.rotate(rotationRad);
     ctx.beginPath();
-    if (activeBrushId === 'square') {
-      ctx.rect(x - finalSize / 2, y - finalSize / 2, finalSize, finalSize);
-    } else {
-      ctx.arc(x, y, finalSize / 2, 0, Math.PI * 2);
-    }
+    if (activeBrushId === 'square') { ctx.rect(-finalSize / 2, -finalSize / 2, finalSize, finalSize); } 
+    else { ctx.arc(0, 0, finalSize / 2, 0, Math.PI * 2); }
     ctx.clip();
-    
-    ctx.drawImage(smudgeBuffer.current, x - finalSize / 2, y - finalSize / 2, finalSize, finalSize);
+    ctx.drawImage(smudgeBuffer.current, -finalSize / 2, -finalSize / 2, finalSize, finalSize);
     ctx.restore();
-
-    // Refresh smudge buffer: Sample current canvas state for next step
     const sCtx = smudgeBuffer.current.getContext('2d')!;
     sCtx.clearRect(0, 0, finalSize, finalSize);
     sCtx.drawImage(ctx.canvas, x - finalSize / 2, y - finalSize / 2, finalSize, finalSize, 0, 0, finalSize, finalSize);
+  };
+
+  const handleApplyText = () => {
+    if (!textInput || !currentTextValue) {
+      setTextInput(null);
+      setCurrentTextValue('');
+      return;
+    }
+    const newLayer = addNewLayer(currentTextValue, true);
+    if (newLayer) {
+      newLayer.ctx.font = `${textFontSize}px ${textFontFamily}`;
+      newLayer.ctx.fillStyle = brushColor;
+      newLayer.ctx.textBaseline = 'top';
+      newLayer.ctx.fillText(currentTextValue, textInput.x, textInput.y);
+      setLayers([...layers]);
+    }
+    setTextInput(null);
+    setCurrentTextValue('');
   };
 
   const hexToRgba = (hex: string, alpha: number) => {
@@ -498,64 +640,72 @@ const App: React.FC = () => {
 
   const startInteraction = (e: React.PointerEvent) => {
     setContextMenu(null);
+    
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const x = (e.clientX - rect.left) * (canvasSize.width / rect.width);
+    const y = (e.clientY - rect.top) * (canvasSize.height / rect.height);
 
-    // Check if clicking a guide
-    if (activeTool === ToolType.MOVE) {
-       const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-       const canvasX = (e.clientX - rect.left) * (canvasSize.width / rect.width);
-       const canvasY = (e.clientY - rect.top) * (canvasSize.height / rect.height);
-       
-       const foundGuide = guides.find(g => {
-         const threshold = 10 / zoom;
-         return g.type === 'v' ? Math.abs(g.pos - canvasX) < threshold : Math.abs(g.pos - canvasY) < threshold;
-       });
-
-       if (foundGuide) {
-         setActiveGuideId(foundGuide.id);
-         return;
-       }
+    if (activeTool === ToolType.SELECT_WAND) {
+      runMagicWand(x, y);
+      return;
     }
 
+    if ([ToolType.SELECT_RECT, ToolType.SELECT_ELLIPSE, ToolType.SELECT_LASSO].includes(activeTool)) {
+      setSelectionActive(true);
+      setSelectionPath([{ x, y }]);
+      return;
+    }
+
+    if (activeTool === ToolType.SELECT_POLY_LASSO) {
+        setSelectionActive(true);
+        if (polyLassoPath.length > 2) {
+            const startNode = polyLassoPath[0];
+            const dist = Math.sqrt(Math.pow(x - startNode.x, 2) + Math.pow(y - startNode.y, 2));
+            if (dist < 10 / zoom) {
+                setSelectionPath([...polyLassoPath]);
+                setPolyLassoPath([]);
+                return;
+            }
+        }
+        setPolyLassoPath(prev => [...prev, { x, y }]);
+        setSelectionPath([...polyLassoPath, { x, y }]);
+        return;
+    }
+
+    if (activeTool === ToolType.TEXT) {
+      setTextInput({ x, y });
+      return;
+    }
+
+    if (activeTool === ToolType.MOVE) {
+       const foundGuide = guides.find(g => {
+         const threshold = 10 / zoom;
+         return g.type === 'v' ? Math.abs(g.pos - x) < threshold : Math.abs(g.pos - y) < threshold;
+       });
+       if (foundGuide) { setActiveGuideId(foundGuide.id); return; }
+    }
     if (activeTool === ToolType.HAND || isSpacePressed || e.button === 1) {
       setIsPanning(true);
       lastPanPos.current = { x: e.clientX, y: e.clientY };
       return;
     }
-
     const activeLayer = getActiveLayer();
     if (!activeLayer || !activeLayer.visible || activeLayer.locked) return;
     if (activeTool === ToolType.MOVE) return;
+    
+    // Save state for undo before starting pixel manipulation
+    if (activeTool !== ToolType.PICKER) { pushToHistory(); }
 
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const x = (e.clientX - rect.left) * (canvasSize.width / rect.width);
-    const y = (e.clientY - rect.top) * (canvasSize.height / rect.height);
-
-    if (activeTool === ToolType.PICKER) {
-      sampleColor(x, y);
-      setIsDrawing(true);
-      return;
-    }
-
-    if (activeTool === ToolType.FILL) {
-        // Flood fill implementation
-        return;
-    }
-
+    if (activeTool === ToolType.PICKER) { sampleColor(x, y); setIsDrawing(true); return; }
     if (activeTool === ToolType.SMUDGE) {
-      // Initialize smudge buffer
-      if (!smudgeBuffer.current) {
-        smudgeBuffer.current = document.createElement('canvas');
-      }
-      smudgeBuffer.current.width = brushSize * 2;
-      smudgeBuffer.current.height = brushSize * 2;
+      if (!smudgeBuffer.current) { smudgeBuffer.current = document.createElement('canvas'); }
+      smudgeBuffer.current.width = brushSize * 2; smudgeBuffer.current.height = brushSize * 2;
       const sCtx = smudgeBuffer.current.getContext('2d')!;
       sCtx.drawImage(activeLayer.canvas, x - brushSize / 2, y - brushSize / 2, brushSize, brushSize, 0, 0, brushSize, brushSize);
     }
-
     setIsDrawing(true);
     lastSmoothPos.current = { x, y };
     brushDistanceCounter.current = 0;
-    
     if (activeTool === ToolType.BRUSH || activeTool === ToolType.ERASER) {
       paintStamp(activeLayer.ctx, x, y, brushSize, brushColor, brushOpacity, e.pressure || 0.5);
     }
@@ -563,93 +713,77 @@ const App: React.FC = () => {
   };
 
   const handleInteraction = (e: React.PointerEvent) => {
-    if (activeGuideId) {
-      const rect = (viewportRef.current as HTMLElement).getBoundingClientRect();
-      const rulerSize = showRulers ? 20 : 0;
-      const contentW = rect.width - rulerSize;
-      const contentH = rect.height - rulerSize;
-      
-      const canvasX = (e.clientX - rect.left - rulerSize - contentW / 2 - canvasOffset.x) / zoom + canvasSize.width / 2;
-      const canvasY = (e.clientY - rect.top - rulerSize - contentH / 2 - canvasOffset.y) / zoom + canvasSize.height / 2;
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const targetX = (e.clientX - rect.left) * (canvasSize.width / rect.width);
+    const targetY = (e.clientY - rect.top) * (canvasSize.height / rect.height);
 
-      const outThreshold = 30;
-      if (e.clientX < rect.left + rulerSize - outThreshold || e.clientY < rect.top + rulerSize - outThreshold) {
-        setGuides(prev => prev.filter(g => g.id !== activeGuideId));
-        setActiveGuideId(null);
-        return;
+    if (selectionActive && [ToolType.SELECT_RECT, ToolType.SELECT_ELLIPSE, ToolType.SELECT_LASSO].includes(activeTool)) {
+      if (activeTool === ToolType.SELECT_RECT || activeTool === ToolType.SELECT_ELLIPSE) {
+        setSelectionPath([selectionPath[0], { x: targetX, y: targetY }]);
+      } else if (activeTool === ToolType.SELECT_LASSO) {
+        setSelectionPath(prev => [...prev, { x: targetX, y: targetY }]);
       }
-
-      setGuides(prev => prev.map(g => {
-        if (g.id === activeGuideId) {
-          return { ...g, pos: g.type === 'v' ? canvasX : canvasY };
-        }
-        return g;
-      }));
       return;
     }
 
+    if (selectionActive && activeTool === ToolType.SELECT_POLY_LASSO) {
+        setSelectionPath([...polyLassoPath, { x: targetX, y: targetY }]);
+        return;
+    }
+
+    if (activeGuideId) {
+      const rectV = (viewportRef.current as HTMLElement).getBoundingClientRect();
+      const rulerSize = showRulers ? 20 : 0;
+      const contentW = rectV.width - rulerSize; const contentH = rectV.height - rulerSize;
+      const canvasX = (e.clientX - rectV.left - rulerSize - contentW / 2 - canvasOffset.x) / zoom + canvasSize.width / 2;
+      const canvasY = (e.clientY - rectV.top - rulerSize - contentH / 2 - canvasOffset.y) / zoom + canvasSize.height / 2;
+      const outThreshold = 30;
+      if (e.clientX < rectV.left + rulerSize - outThreshold || e.clientY < rectV.top + rulerSize - outThreshold) {
+        setGuides(prev => prev.filter(g => g.id !== activeGuideId)); setActiveGuideId(null); return;
+      }
+      setGuides(prev => prev.map(g => g.id === activeGuideId ? { ...g, pos: g.type === 'v' ? canvasX : canvasY } : g));
+      return;
+    }
     if (isPanning) {
       if (lastPanPos.current) {
-        const dx = e.clientX - lastPanPos.current.x;
-        const dy = e.clientY - lastPanPos.current.y;
+        const dx = e.clientX - lastPanPos.current.x; const dy = e.clientY - lastPanPos.current.y;
         setCanvasOffset(prev => ({ x: prev.x + dx, y: prev.y + dy }));
         lastPanPos.current = { x: e.clientX, y: e.clientY };
       }
       return;
     }
-
     if (!isDrawing) return;
     const activeLayer = getActiveLayer();
     if (!activeLayer) return;
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     
-    const targetX = (e.clientX - rect.left) * (canvasSize.width / rect.width);
-    const targetY = (e.clientY - rect.top) * (canvasSize.height / rect.height);
-
-    if (activeTool === ToolType.PICKER) {
-      sampleColor(targetX, targetY);
-      return;
-    }
-
+    if (activeTool === ToolType.PICKER) { sampleColor(targetX, targetY); return; }
     const weight = 1 - Math.pow(brushSmoothing, 1.5);
     const smoothX = lastSmoothPos.current ? lastSmoothPos.current.x * (1 - weight) + targetX * weight : targetX;
     const smoothY = lastSmoothPos.current ? lastSmoothPos.current.y * (1 - weight) + targetY * weight : targetY;
-
     if (lastSmoothPos.current) {
-      const dx = smoothX - lastSmoothPos.current.x;
-      const dy = smoothY - lastSmoothPos.current.y;
+      const dx = smoothX - lastSmoothPos.current.x; const dy = smoothY - lastSmoothPos.current.y;
       const dist = Math.sqrt(dx * dx + dy * dy);
       const step = Math.max(1, brushSize * brushSpacing);
-      
       brushDistanceCounter.current += dist;
-      
       if (brushDistanceCounter.current >= step) {
         const stepsCount = Math.floor(brushDistanceCounter.current / step);
         for (let i = 0; i < stepsCount; i++) {
           const ratio = (i + 1) / stepsCount;
-          const px = lastSmoothPos.current.x + dx * ratio;
-          const py = lastSmoothPos.current.y + dy * ratio;
-          
+          const px = lastSmoothPos.current.x + dx * ratio; const py = lastSmoothPos.current.y + dy * ratio;
           if (activeTool === ToolType.BRUSH || activeTool === ToolType.ERASER) {
             paintStamp(activeLayer.ctx, px, py, brushSize, brushColor, brushOpacity, e.pressure || 0.5);
-          } else if (activeTool === ToolType.SMUDGE) {
-            paintSmudge(activeLayer.ctx, px, py, brushSize, e.pressure || 0.5);
-          }
+          } else if (activeTool === ToolType.SMUDGE) { paintSmudge(activeLayer.ctx, px, py, brushSize, e.pressure || 0.5); }
         }
         brushDistanceCounter.current %= step;
       }
     }
-
     lastSmoothPos.current = { x: smoothX, y: smoothY };
     setLayers([...layers]);
   };
 
   const stopInteraction = () => {
-    setIsDrawing(false);
-    setIsPanning(false);
-    setActiveGuideId(null);
-    lastSmoothPos.current = null;
-    lastPanPos.current = null;
+    setIsDrawing(false); setIsPanning(false); setActiveGuideId(null);
+    lastSmoothPos.current = null; lastPanPos.current = null;
     setLayers([...layers]);
   };
 
@@ -664,61 +798,47 @@ const App: React.FC = () => {
     setIsAIGenerating(true);
     try {
       let resultUrl: string | null = null;
-      if (type === 'generate') {
-        resultUrl = await gemini.generateImage(aiPrompt);
-      } else {
+      if (type === 'generate') { resultUrl = await gemini.generateImage(aiPrompt); } 
+      else {
         const active = getActiveLayer();
-        if (active) {
-          resultUrl = await gemini.editImage(active.canvas.toDataURL(), aiPrompt);
-        }
+        if (active) { resultUrl = await gemini.editImage(active.canvas.toDataURL(), aiPrompt); }
       }
       if (resultUrl) {
+        pushToHistory();
         const img = new Image();
         img.onload = () => {
           const canvas = document.createElement('canvas');
-          canvas.width = canvasSize.width;
-          canvas.height = canvasSize.height;
-          const ctx = canvas.getContext('2d')!;
+          canvas.width = canvasSize.width; canvas.height = canvasSize.height;
+          const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
           ctx.drawImage(img, 0, 0, canvasSize.width, canvasSize.height);
           const newLayer: Layer = {
             id: Math.random().toString(36).substr(2, 9),
-            name: t.layers.aiResult,
-            visible: true,
-            locked: false,
-            opacity: 1,
-            blendMode: 'source-over',
-            canvas,
-            ctx
+            name: t.layers.aiResult, visible: true, locked: false, opacity: 1, blendMode: 'source-over', canvas, ctx
           };
           setLayers(prev => [newLayer, ...prev]);
           setActiveLayerId(newLayer.id);
         };
         img.src = resultUrl;
       }
-    } finally {
-      setIsAIGenerating(false);
-    }
+    } finally { setIsAIGenerating(false); }
   };
 
   const handleApplyHueSaturation = () => {
     const active = getActiveLayer();
     if (!active) return;
-    
+    pushToHistory();
     const { width, height } = canvasSize;
     const imageData = active.ctx.getImageData(0, 0, width, height);
     const data = imageData.data;
-
     for (let i = 0; i < data.length; i += 4) {
       if (data[i+3] === 0) continue;
       const [h, s, l] = rgbToHsl(data[i], data[i+1], data[i+2]);
-      let newH = (h + hueAdjust) % 360;
-      if (newH < 0) newH += 360;
+      let newH = (h + hueAdjust) % 360; if (newH < 0) newH += 360;
       const newS = Math.max(0, Math.min(100, s + satAdjust));
       const newL = Math.max(0, Math.min(100, l + lightAdjust));
       const [r, g, b] = hslToRgb(newH, newS, newL);
       data[i] = r; data[i+1] = g; data[i+2] = b;
     }
-
     active.ctx.putImageData(imageData, 0, 0);
     setLayers([...layers]);
     setShowHueSatModal(false);
@@ -727,24 +847,47 @@ const App: React.FC = () => {
   const handleABRImport = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    
     const reader = new FileReader();
-    reader.onload = (event) => {
-      const img = new Image();
-      img.onload = () => {
-        const newBrush: BrushPreset = {
-          id: Math.random().toString(36).substr(2, 9),
-          name: file.name.split('.')[0],
-          image: img,
-          spacing: 0.2,
-          hardness: 1.0,
-          isCustom: true
-        };
-        setBrushPresets(prev => [...prev, newBrush]);
-        setActiveBrushId(newBrush.id);
+    if (file.name.toLowerCase().endsWith('.abr')) {
+      reader.onload = async (event) => {
+        const buffer = event.target?.result as ArrayBuffer;
+        const parsedBrushes = await parseAbr(buffer);
+        if (parsedBrushes.length === 0) return;
+        const newPresets: BrushPreset[] = parsedBrushes.map(pb => {
+          const img = new Image();
+          img.src = pb.dataUrl;
+          return {
+            id: Math.random().toString(36).substr(2, 9),
+            name: pb.name,
+            image: img,
+            spacing: 0.15,
+            hardness: 1.0,
+            size: pb.width,
+            isCustom: true
+          };
+        });
+        setBrushPresets(prev => [...prev, ...newPresets]);
+        setActiveBrushId(newPresets[0].id);
+        setShowBrushLib(true);
       };
-      img.src = event.target?.result as string;
-    };
-    reader.readAsDataURL(file);
+      reader.readAsArrayBuffer(file);
+    } else {
+      reader.onload = (event) => {
+        const img = new Image();
+        img.onload = () => {
+          const newBrush: BrushPreset = {
+            id: Math.random().toString(36).substr(2, 9),
+            name: file.name.split('.')[0],
+            image: img, spacing: 0.2, hardness: 1.0, isCustom: true
+          };
+          setBrushPresets(prev => [...prev, newBrush]);
+          setActiveBrushId(newBrush.id);
+        };
+        img.src = event.target?.result as string;
+      };
+      reader.readAsDataURL(file);
+    }
   };
 
   const handleSaveCurrentBrushAsPreset = () => {
@@ -752,12 +895,8 @@ const App: React.FC = () => {
     const newPreset: BrushPreset = {
       id: Math.random().toString(36).substr(2, 9),
       name: `${currentActive?.name || 'Brush'} ${Date.now().toString().slice(-4)}`,
-      image: currentActive?.image,
-      icon: currentActive?.icon,
-      spacing: brushSpacing,
-      hardness: brushHardness,
-      size: brushSize,
-      isCustom: true
+      image: currentActive?.image, icon: currentActive?.icon,
+      spacing: brushSpacing, hardness: brushHardness, size: brushSize, isCustom: true
     };
     setBrushPresets(prev => [...prev, newPreset]);
     setActiveBrushId(newPreset.id);
@@ -779,7 +918,6 @@ const App: React.FC = () => {
     if (index === -1) return;
     if (direction === 'up' && index === 0) return;
     if (direction === 'down' && index === brushPresets.length - 1) return;
-
     const newPresets = [...brushPresets];
     const targetIdx = direction === 'up' ? index - 1 : index + 1;
     [newPresets[index], newPresets[targetIdx]] = [newPresets[targetIdx], newPresets[index]];
@@ -798,44 +936,28 @@ const App: React.FC = () => {
     reader.readAsDataURL(file);
   };
 
-  // Brush Drag and Drop Handlers
-  const handleBrushDragStart = (idx: number) => {
-    setDraggedBrushIdx(idx);
-  };
-
-  const handleBrushDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
-  };
-
+  const handleBrushDragStart = (idx: number) => { setDraggedBrushIdx(idx); };
+  const handleBrushDragOver = (e: React.DragEvent) => { e.preventDefault(); };
   const handleBrushDrop = (targetIdx: number) => {
     if (draggedBrushIdx === null || draggedBrushIdx === targetIdx) return;
     const newPresets = [...brushPresets];
     const [removed] = newPresets.splice(draggedBrushIdx, 1);
     newPresets.splice(targetIdx, 0, removed);
-    setBrushPresets(newPresets);
-    setDraggedBrushIdx(null);
+    setBrushPresets(newPresets); setDraggedBrushIdx(null);
   };
 
   const handleRulerMouseDown = (type: 'h' | 'v', e: React.MouseEvent) => {
     const id = Math.random().toString(36).substr(2, 9);
     const rect = (viewportRef.current as HTMLElement).getBoundingClientRect();
-    const rulerSize = 20;
-    const contentW = rect.width - rulerSize;
-    const contentH = rect.height - rulerSize;
-    
+    const rulerSize = 20; const contentW = rect.width - rulerSize; const contentH = rect.height - rulerSize;
     const canvasX = (e.clientX - rect.left - rulerSize - contentW / 2 - canvasOffset.x) / zoom + canvasSize.width / 2;
     const canvasY = (e.clientY - rect.top - rulerSize - contentH / 2 - canvasOffset.y) / zoom + canvasSize.height / 2;
-
     const newGuide: Guide = { id, type, pos: type === 'v' ? canvasX : canvasY };
-    setGuides(prev => [...prev, newGuide]);
-    setActiveGuideId(id);
+    setGuides(prev => [...prev, newGuide]); setActiveGuideId(id);
   };
 
   const toggleLanguage = () => setLang(prev => prev === 'en' ? 'zh' : 'en');
-  const closeMenus = () => {
-    setActiveMenu(null);
-    setContextMenu(null);
-  };
+  const closeMenus = () => { setActiveMenu(null); setContextMenu(null); };
 
   const menuData = [
     { id: 'file', label: t.menus.file, items: [
@@ -846,6 +968,10 @@ const App: React.FC = () => {
       { label: t.menus.items.exit, action: () => window.close() },
     ]},
     { id: 'edit', label: t.menus.edit, items: [
+        { id: 'UNDO', label: t.menus.items.undo, action: undo },
+        { id: 'REDO', label: t.menus.items.redo, action: redo },
+        { separator: true },
+        { id: 'DESELECT', label: t.menus.items.deselect, action: deselect },
         { label: t.menus.items.shortcuts, action: () => setShowShortcutsModal(true) },
     ]},
     { id: 'image', label: t.menus.image, items: [
@@ -881,31 +1007,23 @@ const App: React.FC = () => {
     if (activeTool === ToolType.HAND || isSpacePressed) return { cursor: 'grab' };
     if (activeTool === ToolType.PICKER) return { cursor: 'crosshair' };
     if (activeTool === ToolType.MOVE) return { cursor: 'default' };
-    
+    if (activeTool === ToolType.TEXT) return { cursor: 'text' };
+    if (activeTool === ToolType.SELECT_WAND) return { cursor: 'cell' };
+    if ([ToolType.SELECT_RECT, ToolType.SELECT_ELLIPSE, ToolType.SELECT_LASSO, ToolType.SELECT_POLY_LASSO].includes(activeTool)) return { cursor: 'crosshair' };
     if (activeTool === ToolType.BRUSH || activeTool === ToolType.ERASER || activeTool === ToolType.SMUDGE) {
       const scaledSize = Math.max(2, brushSize * zoom);
-      const radius = scaledSize / 2;
-      const center = radius;
-      const svg = `
-        <svg xmlns="http://www.w3.org/2000/svg" width="${scaledSize}" height="${scaledSize}" viewBox="0 0 ${scaledSize} ${scaledSize}">
-          <circle cx="${center}" cy="${center}" r="${radius - 1}" fill="none" stroke="white" stroke-width="1" stroke-opacity="0.8"/>
-          <circle cx="${center}" cy="${center}" r="${radius}" fill="none" stroke="black" stroke-width="1" stroke-opacity="0.5"/>
-        </svg>
-      `.trim();
-      const base64 = btoa(svg);
-      return { cursor: `url("data:image/svg+xml;base64,${base64}") ${center} ${center}, crosshair` };
+      const radius = scaledSize / 2; const center = radius;
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${scaledSize}" height="${scaledSize}" viewBox="0 0 ${scaledSize} ${scaledSize}"><circle cx="${center}" cy="${center}" r="${radius - 1}" fill="none" stroke="white" stroke-width="1" stroke-opacity="0.8"/><circle cx="${center}" cy="${center}" r="${radius}" fill="none" stroke="black" stroke-width="1" stroke-opacity="0.5"/></svg>`.trim();
+      return { cursor: `url("data:image/svg+xml;base64,${btoa(svg)}") ${center} ${center}, crosshair` };
     }
-
     return { cursor: 'crosshair' };
   }, [activeTool, brushSize, zoom, isPanning, isSpacePressed, activeGuideId, guides]);
 
   return (
     <div className="flex h-screen w-screen bg-[#121212] text-gray-300 overflow-hidden select-none flex-col" onClick={closeMenus}>
-      {/* Hidden inputs */}
       <input ref={iconInputRef} type="file" accept="image/*" className="hidden" onChange={handleBrushIconChange} />
       <input ref={workspaceColorRef} type="color" className="hidden" onChange={(e) => setWorkspaceColor(e.target.value)} />
       
-      {/* Menu Bar */}
       <nav className="h-8 bg-[#1e1e1e] border-b border-[#2a2a2a] flex items-center px-2 z-[100] relative">
         <div className="flex items-center h-full">
             {menuData.map((menu) => (
@@ -920,7 +1038,11 @@ const App: React.FC = () => {
                                 item.separator ? <div key={idx} className="h-px bg-[#333] my-1 mx-2" /> :
                                 <button key={idx} className="w-full text-left px-4 py-1.5 text-[11px] hover:bg-orange-600 hover:text-white transition-colors"
                                     onClick={(e) => { e.stopPropagation(); item.action?.(); closeMenus(); }}>
-                                    {item.label}
+                                    <div className="flex items-center justify-between">
+                                      <span>{item.label}</span>
+                                      {('id' in item && item.id === 'UNDO') && <Undo2 size={12} className="opacity-40" />}
+                                      {('id' in item && item.id === 'REDO') && <Redo2 size={12} className="opacity-40" />}
+                                    </div>
                                 </button>
                             ))}
                         </div>
@@ -935,28 +1057,35 @@ const App: React.FC = () => {
       </nav>
 
       <div className="flex flex-1 overflow-hidden">
-        {/* Left Toolbar */}
         <aside className="w-16 bg-[#1e1e1e] border-r border-[#2a2a2a] flex flex-col items-center py-4 gap-4 z-50">
             <div className="mb-2 text-orange-500 font-bold text-xl tracking-tighter">PM</div>
             <ToolButton icon={<MousePointer2 size={18} />} active={activeTool === ToolType.MOVE} onClick={() => setActiveTool(ToolType.MOVE)} label={t.tools.move} />
+            <div className="h-px w-8 bg-[#333]" />
+            <ToolButton icon={<Square size={18} />} active={activeTool === ToolType.SELECT_RECT} onClick={() => setActiveTool(ToolType.SELECT_RECT)} label={t.tools.selectRect} />
+            <ToolButton icon={<Circle size={18} />} active={activeTool === ToolType.SELECT_ELLIPSE} onClick={() => setActiveTool(ToolType.SELECT_ELLIPSE)} label={t.tools.selectEllipse} />
+            <ToolButton icon={<Spline size={18} />} active={activeTool === ToolType.SELECT_LASSO} onClick={() => setActiveTool(ToolType.SELECT_LASSO)} label={t.tools.selectLasso} />
+            <ToolButton icon={<Hexagon size={18} />} active={activeTool === ToolType.SELECT_POLY_LASSO} onClick={() => setActiveTool(ToolType.SELECT_POLY_LASSO)} label={t.tools.selectPolyLasso} />
+            <ToolButton icon={<Wand2 size={18} />} active={activeTool === ToolType.SELECT_WAND} onClick={() => setActiveTool(ToolType.SELECT_WAND)} label={t.tools.selectWand} />
+            <div className="h-px w-8 bg-[#333]" />
             <ToolButton icon={<Paintbrush size={18} />} active={activeTool === ToolType.BRUSH} onClick={() => setActiveTool(ToolType.BRUSH)} label={t.tools.brush} />
             <ToolButton icon={<Fingerprint size={18} />} active={activeTool === ToolType.SMUDGE} onClick={() => setActiveTool(ToolType.SMUDGE)} label={t.tools.smudge} />
             <ToolButton icon={<Eraser size={18} />} active={activeTool === ToolType.ERASER} onClick={() => setActiveTool(ToolType.ERASER)} label={t.tools.eraser} />
             <ToolButton icon={<PaintBucket size={18} />} active={activeTool === ToolType.FILL} onClick={() => setActiveTool(ToolType.FILL)} label={t.tools.fill} />
+            <ToolButton icon={<TypeIcon size={18} />} active={activeTool === ToolType.TEXT} onClick={() => setActiveTool(ToolType.TEXT)} label={t.tools.text} />
             <ToolButton icon={<Pipette size={18} />} active={activeTool === ToolType.PICKER} onClick={() => setActiveTool(ToolType.PICKER)} label={t.tools.picker} />
             <ToolButton icon={<Hand size={18} />} active={activeTool === ToolType.HAND} onClick={() => setActiveTool(ToolType.HAND)} label={t.tools.hand} />
             <ToolButton icon={<Sparkles size={18} />} active={activeTool === ToolType.AI_EDIT} onClick={() => setActiveTool(ToolType.AI_EDIT)} label={t.tools.aiMagic} />
             <div className="mt-auto border-t border-[#2a2a2a] pt-4 w-full flex flex-col items-center gap-4">
+              <button onClick={undo} disabled={history.length === 0} className="p-2 hover:bg-[#2a2a2a] rounded transition-colors disabled:opacity-20" title={t.menus.items.undo}><Undo2 size={18} /></button>
+              <button onClick={redo} disabled={redoStack.length === 0} className="p-2 hover:bg-[#2a2a2a] rounded transition-colors disabled:opacity-20" title={t.menus.items.redo}><Redo2 size={18} /></button>
               <div className="relative group">
                 <input type="color" value={brushColor} onChange={(e) => setBrushColor(e.target.value)} className="w-8 h-8 border-none bg-transparent cursor-pointer rounded-full relative z-10" />
                 <div className="absolute inset-0 rounded-full border border-white/20 group-hover:border-orange-500 transition-colors" />
-                <div className="absolute top-0 left-full ml-4 bg-black/90 text-white text-[10px] px-3 py-1.5 rounded-lg opacity-0 group-hover:opacity-100 pointer-events-none whitespace-nowrap transition-all border border-white/10 z-[100] uppercase tracking-widest">{brushColor}</div>
               </div>
               <button onClick={handleDownload} className="p-2 hover:bg-[#2a2a2a] rounded transition-colors" title={t.tools.export}><Download size={18} /></button>
             </div>
         </aside>
 
-        {/* Main Content Area */}
         <main className="flex-1 flex flex-col overflow-hidden relative">
             <header className="h-10 bg-[#1e1e1e] border-b border-[#2a2a2a] flex items-center px-4 gap-6 z-40 overflow-x-auto custom-scrollbar">
               <div className="flex items-center gap-4 min-w-max">
@@ -975,20 +1104,32 @@ const App: React.FC = () => {
                       <HeaderControl label={t.brushSettings.smoothing} min={0} max={1} step={0.01} value={brushSmoothing} onChange={setBrushSmoothing} percentage />
                       <HeaderControl label={t.brushSettings.spacing} min={0.01} max={1} step={0.01} value={brushSpacing} onChange={setBrushSpacing} percentage />
                       <HeaderControl label={t.brushSettings.hardness} min={0} max={1} step={0.01} value={brushHardness} onChange={setBrushHardness} percentage />
+                      <HeaderControl label={t.brushSettings.rotation} min={0} max={360} step={1} value={brushRotation} onChange={setBrushRotation} />
                     </>
-                  ) : activeTool === ToolType.FILL ? (
+                  ) : activeTool === ToolType.TEXT ? (
                     <>
-                      <span className="text-[10px] font-bold text-orange-500 uppercase tracking-widest flex items-center gap-2">
-                        <PaintBucket size={14} /> {t.tools.fill}
-                      </span>
+                      <span className="text-[10px] font-bold text-orange-500 uppercase tracking-widest flex items-center gap-2"><TypeIcon size={14} /> {t.tools.text}</span>
+                      <div className="h-4 w-px bg-[#333]" />
+                      <HeaderControl label={t.brushSettings.fontSize} min={8} max={200} value={textFontSize} onChange={setTextFontSize} />
+                      <div className="flex items-center gap-2">
+                        <span className="text-[9px] uppercase text-gray-500 font-bold">{t.brushSettings.fontFamily}</span>
+                        <select value={textFontFamily} onChange={e => setTextFontFamily(e.target.value)} className="bg-[#2a2a2a] border border-[#333] rounded text-[10px] py-1 px-2 focus:outline-none">
+                          <option value="sans-serif">Sans Serif</option>
+                          <option value="serif">Serif</option>
+                          <option value="monospace">Monospace</option>
+                          <option value="cursive">Cursive</option>
+                        </select>
+                      </div>
+                    </>
+                  ) : (activeTool === ToolType.FILL || activeTool === ToolType.SELECT_WAND) ? (
+                    <>
+                      <span className="text-[10px] font-bold text-orange-500 uppercase tracking-widest flex items-center gap-2">{activeTool === ToolType.SELECT_WAND ? <Wand2 size={14}/> : <PaintBucket size={14} />} {activeTool === ToolType.SELECT_WAND ? t.tools.selectWand : t.tools.fill}</span>
                       <div className="h-4 w-px bg-[#333]" />
                       <HeaderControl label={t.brushSettings.tolerance} min={0} max={255} value={fillTolerance} onChange={setFillTolerance} />
                     </>
                   ) : activeTool === ToolType.PICKER ? (
                     <>
-                      <span className="text-[10px] font-bold text-orange-500 uppercase tracking-widest flex items-center gap-2">
-                        <Pipette size={14} /> {t.tools.picker}
-                      </span>
+                      <span className="text-[10px] font-bold text-orange-500 uppercase tracking-widest flex items-center gap-2"><Pipette size={14} /> {t.tools.picker}</span>
                       <div className="h-4 w-px bg-[#333]" />
                       <div className="flex items-center gap-2">
                         <span className="text-[9px] uppercase text-gray-500 font-bold">{t.brushSettings.currentColor}</span>
@@ -996,63 +1137,54 @@ const App: React.FC = () => {
                         <span className="text-[10px] font-mono text-gray-400 uppercase">{brushColor}</span>
                       </div>
                     </>
-                  ) : activeTool === ToolType.HAND ? (
-                    <span className="text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center gap-2">
-                      <Hand size={14} /> {t.tools.hand}
-                    </span>
                   ) : (
                     <span className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">{t.tools.move}</span>
                   )}
               </div>
-
               {showBrushLib && (
-                <div className="absolute top-12 left-4 w-72 bg-[#1e1e1e] border border-[#333] rounded-xl shadow-2xl p-4 z-50 animate-in fade-in slide-in-from-top-2" onClick={e => e.stopPropagation()}>
+                <div className="absolute top-12 left-4 w-80 bg-[#1e1e1e] border border-[#333] rounded-xl shadow-2xl p-4 z-50 animate-in fade-in slide-in-from-top-2" onClick={e => e.stopPropagation()}>
                   <div className="flex justify-between items-center mb-4">
                     <h3 className="text-[10px] font-black uppercase text-orange-500 tracking-widest">{t.brushSettings.library}</h3>
                     <div className="flex gap-2">
-                      <button onClick={handleSaveCurrentBrushAsPreset} className="p-1 hover:bg-[#333] rounded text-gray-400 hover:text-white" title={t.brushSettings.savePreset}>
-                        <FilePlus size={14} />
-                      </button>
-                      <button onClick={() => abrInputRef.current?.click()} className="p-1 hover:bg-[#333] rounded text-gray-400 hover:text-white" title={t.brushSettings.import}>
-                        <Upload size={14} />
-                      </button>
+                      <button onClick={handleSaveCurrentBrushAsPreset} className="p-1 hover:bg-[#333] rounded text-gray-400 hover:text-white" title={t.brushSettings.savePreset}><FilePlus size={14} /></button>
+                      <button onClick={() => abrInputRef.current?.click()} className="p-1 hover:bg-[#333] rounded text-gray-400 hover:text-white" title={t.brushSettings.import}><Upload size={14} /></button>
                     </div>
                     <input ref={abrInputRef} type="file" accept=".abr,image/*" className="hidden" onChange={handleABRImport} />
                   </div>
+                  
+                  <div className="relative mb-4 group">
+                    <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                      <Search size={12} className="text-gray-500 group-focus-within:text-orange-500 transition-colors" />
+                    </div>
+                    <input 
+                      type="text" 
+                      placeholder={t.brushSettings.searchPlaceholder}
+                      value={brushSearchTerm}
+                      onChange={e => setBrushSearchTerm(e.target.value)}
+                      className="w-full bg-black/40 border border-[#333] rounded-lg py-1.5 pl-8 pr-8 text-[11px] focus:outline-none focus:border-orange-500/50 transition-all"
+                    />
+                    {brushSearchTerm && (
+                      <button onClick={() => setBrushSearchTerm('')} className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-500 hover:text-white"><X size={12} /></button>
+                    )}
+                  </div>
+
                   <div className="flex flex-col gap-1 max-h-80 overflow-y-auto custom-scrollbar p-1">
-                    {brushPresets.map((brush, index) => (
-                      <div 
-                        key={brush.id} 
-                        draggable
-                        onDragStart={() => handleBrushDragStart(index)}
-                        onDragOver={handleBrushDragOver}
-                        onDrop={() => handleBrushDrop(index)}
+                    {filteredBrushPresets.length > 0 ? filteredBrushPresets.map((brush, index) => (
+                      <div key={brush.id} draggable onDragStart={() => handleBrushDragStart(index)} onDragOver={handleBrushDragOver} onDrop={() => handleBrushDrop(index)}
                         onClick={() => { 
-                          setActiveBrushId(brush.id); 
-                          if (brush.spacing !== undefined) setBrushSpacing(brush.spacing);
-                          if (brush.hardness !== undefined) setBrushHardness(brush.hardness);
-                          if (brush.size !== undefined) setBrushSize(brush.size);
-                          setShowBrushLib(false); 
+                          setActiveBrushId(brush.id); if (brush.spacing !== undefined) setBrushSpacing(brush.spacing); if (brush.hardness !== undefined) setBrushHardness(brush.hardness); if (brush.size !== undefined) setBrushSize(brush.size); setShowBrushLib(false); 
                         }}
                         className={`group relative flex items-center gap-3 p-2 rounded-lg border transition-all cursor-pointer ${activeBrushId === brush.id ? 'border-orange-500 bg-orange-500/10' : 'border-transparent hover:bg-black/20'} ${draggedBrushIdx === index ? 'opacity-40 grayscale scale-95' : ''}`}>
-                        
-                        <div className="shrink-0 text-gray-600 opacity-0 group-hover:opacity-100 cursor-grab active:cursor-grabbing transition-opacity">
-                          <GripVertical size={14} />
+                        <div className="shrink-0 text-gray-600 opacity-0 group-hover:opacity-100 cursor-grab active:cursor-grabbing transition-opacity"><GripVertical size={14} /></div>
+                        <div className="w-10 h-10 rounded bg-black/40 flex items-center justify-center overflow-hidden shrink-0 border border-white/5 relative">
+                          <div className="absolute inset-0 flex items-center justify-center p-1">
+                            {brush.icon ? <img src={brush.icon} className="w-full h-full object-cover" /> : brush.image ? <img src={brush.image.src} className="w-full h-full object-contain invert opacity-80" /> : <div className="w-full h-full flex items-center justify-center"><div className="w-4 h-4 bg-white" style={{ borderRadius: brush.id === 'square' ? '0' : '50%', opacity: brush.id === 'soft' ? 0.4 : 1 }} /></div>}
+                          </div>
                         </div>
-
-                        <div className="w-8 h-8 rounded bg-black/40 flex items-center justify-center overflow-hidden shrink-0">
-                          {brush.icon ? <img src={brush.icon} className="w-full h-full object-cover" /> : 
-                           brush.image ? <img src={brush.image.src} className="w-full h-full object-contain invert grayscale" /> : 
-                           brush.id === 'round' ? <Circle size={16} fill="white" /> : 
-                           brush.id === 'soft' ? <Circle size={16} fill="white" className="opacity-40" /> :
-                           <div className="w-4 h-4 bg-white" />}
-                        </div>
-
                         <div className="flex-1 min-w-0">
                           <div className="text-[10px] font-bold truncate text-gray-300 group-hover:text-white">{brush.name}</div>
-                          <div className="text-[8px] text-gray-500 uppercase tracking-tighter">S: {brush.spacing} H: {brush.hardness}</div>
+                          <div className="text-[8px] text-gray-500 uppercase tracking-tighter mt-0.5">{brush.size ? `${brush.size}px` : 'Dynamic'} • {brush.hardness !== undefined ? `H:${Math.round(brush.hardness * 100)}%` : ''}</div>
                         </div>
-
                         <div className="hidden group-hover:flex items-center gap-1 shrink-0">
                           <button onClick={(e) => { e.stopPropagation(); setTargetIconBrushId(brush.id); iconInputRef.current?.click(); }} className="p-1 hover:bg-[#333] rounded text-gray-400 hover:text-orange-500" title={t.brushSettings.changeIcon}><ImageIcon size={10}/></button>
                           <button onClick={(e) => handleMoveBrush(brush.id, 'up', e)} disabled={index === 0} className="p-1 hover:bg-[#333] rounded text-gray-400 hover:text-white disabled:opacity-20"><ChevronUp size={10}/></button>
@@ -1060,57 +1192,47 @@ const App: React.FC = () => {
                           <button onClick={(e) => handleDeleteBrushPreset(brush.id, e)} className="p-1 hover:bg-[#333] rounded text-gray-400 hover:text-red-500"><Trash2 size={10}/></button>
                         </div>
                       </div>
-                    ))}
+                    )) : <div className="py-8 text-center text-gray-600 text-[10px] uppercase font-bold tracking-widest">{lang === 'en' ? 'No brushes found' : '未找到笔刷'}</div>}
                   </div>
                 </div>
               )}
             </header>
 
-            <div 
-              ref={viewportRef} 
-              onWheel={handleWheel}
-              onContextMenu={handleContextMenu}
-              style={{ ...getCursorStyle(), backgroundColor: workspaceColor }}
-              className="flex-1 overflow-hidden flex relative workspace-area transition-colors duration-200"
-            >
+            <div ref={viewportRef} onContextMenu={handleContextMenu} style={{ ...getCursorStyle(), backgroundColor: workspaceColor }} className="flex-1 overflow-hidden flex relative workspace-area transition-colors duration-200">
               {showRulers && (
                 <>
-                  <div className="absolute top-0 left-5 right-0 h-5 bg-[#2a2a2a] border-b border-[#3a3a3a] z-[60] overflow-hidden cursor-row-resize" onMouseDown={(e) => handleRulerMouseDown('h', e)}>
-                    <Ruler orientation="horizontal" size={canvasSize.width} zoom={zoom} offset={canvasOffset.x} />
-                  </div>
-                  <div className="absolute top-5 left-0 bottom-0 w-5 bg-[#2a2a2a] border-r border-[#3a3a3a] z-[60] overflow-hidden cursor-col-resize" onMouseDown={(e) => handleRulerMouseDown('v', e)}>
-                    <Ruler orientation="vertical" size={canvasSize.height} zoom={zoom} offset={canvasOffset.y} />
-                  </div>
+                  <div className="absolute top-0 left-5 right-0 h-5 bg-[#2a2a2a] border-b border-[#3a3a3a] z-[60] overflow-hidden cursor-row-resize" onMouseDown={(e) => handleRulerMouseDown('h', e)}><Ruler orientation="horizontal" size={canvasSize.width} zoom={zoom} offset={canvasOffset.x} /></div>
+                  <div className="absolute top-5 left-0 bottom-0 w-5 bg-[#2a2a2a] border-r border-[#3a3a3a] z-[60] overflow-hidden cursor-col-resize" onMouseDown={(e) => handleRulerMouseDown('v', e)}><Ruler orientation="vertical" size={canvasSize.height} zoom={zoom} offset={canvasOffset.y} /></div>
                   <div className="absolute top-0 left-0 w-5 h-5 bg-[#2a2a2a] border-r border-b border-[#3a3a3a] z-[60]" />
                 </>
               )}
-
               <div className="flex-1 overflow-hidden relative flex items-center justify-center workspace-area pointer-events-none">
                 <div className="relative shadow-2xl checkerboard transition-transform duration-75 ease-out origin-center pointer-events-auto"
-                  style={{ 
-                    width: canvasSize.width, 
-                    height: canvasSize.height, 
-                    transform: `translate(${canvasOffset.x}px, ${canvasOffset.y}px) scale(${zoom})` 
-                  }}
+                  style={{ width: canvasSize.width, height: canvasSize.height, transform: `translate(${canvasOffset.x}px, ${canvasOffset.y}px) scale(${zoom})` }}
                   onPointerDown={startInteraction} onPointerMove={handleInteraction} onPointerUp={stopInteraction} onPointerLeave={stopInteraction}>
-                  {[...layers].reverse().map((layer) => (
-                    <CanvasLayer key={layer.id} layer={layer} previewFilter={activeLayerId === layer.id ? previewFilter : ''} />
-                  ))}
+                  {[...layers].reverse().map((layer) => <CanvasLayer key={layer.id} layer={layer} previewFilter={activeLayerId === layer.id ? previewFilter : ''} />)}
                   
+                  {/* Selection Overlay Canvas */}
+                  <canvas 
+                    ref={selectionCanvasRef} 
+                    width={canvasSize.width} 
+                    height={canvasSize.height} 
+                    className="absolute inset-0 pointer-events-none z-[110]" 
+                  />
+
+                  {/* Text Input UI */}
+                  {textInput && (
+                    <div className="absolute z-[200] pointer-events-auto" style={{ left: textInput.x, top: textInput.y, transform: `scale(${1/zoom})`, transformOrigin: '0 0' }}>
+                      <div className="flex flex-col gap-1">
+                        <textarea autoFocus className="bg-[#1e1e1e] border border-orange-500 text-white p-2 rounded shadow-2xl focus:outline-none min-w-[200px]" style={{ fontSize: `${textFontSize}px`, fontFamily: textFontFamily, color: brushColor }} placeholder={t.brushSettings.textPlaceholder} value={currentTextValue} onChange={e => setCurrentTextValue(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && e.ctrlKey) handleApplyText(); if (e.key === 'Escape') setTextInput(null); }} />
+                        <div className="flex gap-1 justify-end"><button onClick={handleApplyText} className="p-1 bg-orange-600 rounded hover:bg-orange-700 transition-colors"><Check size={16}/></button><button onClick={() => setTextInput(null)} className="p-1 bg-[#2a2a2a] rounded hover:bg-[#333] transition-colors"><X size={16}/></button></div>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="absolute inset-0 pointer-events-none z-[100]">
                     {guides.map(guide => (
-                      <div 
-                        key={guide.id} 
-                        className={`absolute bg-[#00ffff] pointer-events-auto ${guide.type === 'v' ? 'w-px cursor-col-resize' : 'h-px cursor-row-resize'}`}
-                        style={{ 
-                          [guide.type === 'v' ? 'left' : 'top']: `${guide.pos}px`,
-                          [guide.type === 'v' ? 'top' : 'left']: '-5000px',
-                          [guide.type === 'v' ? 'bottom' : 'right']: '-5000px',
-                          height: guide.type === 'v' ? '10000px' : '1px',
-                          width: guide.type === 'h' ? '10000px' : '1px',
-                          boxShadow: '0 0 1px rgba(0,0,0,0.5)'
-                        }}
-                      />
+                      <div key={guide.id} className={`absolute bg-[#00ffff] pointer-events-auto ${guide.type === 'v' ? 'w-px cursor-col-resize' : 'h-px cursor-row-resize'}`} style={{ [guide.type === 'v' ? 'left' : 'top']: `${guide.pos}px`, [guide.type === 'v' ? 'top' : 'left']: '-5000px', [guide.type === 'v' ? 'bottom' : 'right']: '-5000px', height: guide.type === 'v' ? '10000px' : '1px', width: guide.type === 'h' ? '10000px' : '1px', boxShadow: '0 0 1px rgba(0,0,0,0.5)' }} />
                     ))}
                   </div>
                 </div>
@@ -1118,7 +1240,6 @@ const App: React.FC = () => {
               </div>
             </div>
 
-            {/* AI Prompt Area */}
             <div className="absolute bottom-6 left-1/2 -translate-x-1/2 w-full max-w-2xl px-4 z-40">
               <div className="bg-[#1e1e1e]/90 backdrop-blur-md border border-[#333] rounded-2xl shadow-2xl p-4 flex flex-col gap-3">
                 <div className="flex items-center justify-between text-[10px] font-black text-orange-500 uppercase tracking-widest">
@@ -1126,40 +1247,29 @@ const App: React.FC = () => {
                   {isAIGenerating && <span className="animate-pulse text-gray-400">{t.aiWorkspace.processing}</span>}
                 </div>
                 <div className="flex gap-2">
-                  <input type="text" value={aiPrompt} onChange={(e) => setAiPrompt(e.target.value)} placeholder={t.aiWorkspace.placeholder}
-                    className="flex-1 bg-[#121212] border border-[#333] rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-orange-500 transition-colors" />
-                  <button onClick={() => handleAIAction('generate')} disabled={isAIGenerating} className="bg-orange-600 hover:bg-orange-700 text-white px-5 py-2 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-50">
-                    {t.aiWorkspace.generate}
-                  </button>
-                  <button onClick={() => handleAIAction('edit')} disabled={isAIGenerating} className="bg-[#2a2a2a] hover:bg-[#333] border border-[#333] text-white px-5 py-2 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-50">
-                    {t.aiWorkspace.editLayer}
-                  </button>
+                  <input type="text" value={aiPrompt} onChange={(e) => setAiPrompt(e.target.value)} placeholder={t.aiWorkspace.placeholder} className="flex-1 bg-[#121212] border border-[#333] rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-orange-500 transition-colors" />
+                  <button onClick={() => handleAIAction('generate')} disabled={isAIGenerating} className="bg-orange-600 hover:bg-orange-700 text-white px-5 py-2 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-50">{t.aiWorkspace.generate}</button>
+                  <button onClick={() => handleAIAction('edit')} disabled={isAIGenerating} className="bg-[#2a2a2a] hover:bg-[#333] border border-[#333] text-white px-5 py-2 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-50">{t.aiWorkspace.editLayer}</button>
                 </div>
               </div>
             </div>
         </main>
 
-        {/* Right Sidebar */}
         <aside className="w-72 bg-[#1e1e1e] border-l border-[#2a2a2a] flex flex-col z-50">
             <div className="p-4 border-b border-[#2a2a2a]">
               <h2 className="text-[10px] font-black uppercase tracking-widest text-gray-500 mb-4 flex items-center gap-2"><Layers size={14} /> {t.layers.title}</h2>
-              <button onClick={() => addNewLayer()} className="w-full py-2 bg-[#2a2a2a] hover:bg-[#333] rounded-xl border border-[#333] text-xs font-bold transition-colors">
-                <Plus size={16} className="inline mr-1" /> {t.layers.newLayer}
-              </button>
+              <button onClick={() => addNewLayer()} className="w-full py-2 bg-[#2a2a2a] hover:bg-[#333] rounded-xl border border-[#333] text-xs font-bold transition-colors"><Plus size={16} className="inline mr-1" /> {t.layers.newLayer}</button>
             </div>
             <div className="flex-1 overflow-y-auto custom-scrollbar p-2">
               {layers.map(layer => (
                 <div key={layer.id} onClick={() => setActiveLayerId(layer.id)}
                   className={`group flex flex-col p-3 mb-1 rounded-xl cursor-pointer transition-all border ${activeLayerId === layer.id ? 'bg-[#2a2a2a] border-orange-500/50 shadow-lg' : 'hover:bg-[#252525] border-transparent'}`}>
                   <div className="flex items-center gap-3">
-                    <button onClick={(e) => { e.stopPropagation(); layer.visible = !layer.visible; setLayers([...layers]); }} className={`p-1.5 rounded-lg hover:bg-black/20 ${!layer.visible ? 'text-gray-600' : 'text-gray-300'}`}>
-                      {layer.visible ? <Eye size={16} /> : <EyeOff size={16} />}
-                    </button>
+                    <button onClick={(e) => { e.stopPropagation(); layer.visible = !layer.visible; setLayers([...layers]); }} className={`p-1.5 rounded-lg hover:bg-black/20 ${!layer.visible ? 'text-gray-600' : 'text-gray-300'}`}>{layer.visible ? <Eye size={16} /> : <EyeOff size={16} />}</button>
                     <div className="w-12 h-12 bg-black/40 rounded-lg border border-[#333] overflow-hidden"><Thumbnail canvas={layer.canvas} /></div>
                     <div className="flex-1 overflow-hidden">
                       {editingLayerId === layer.id ? 
-                        <input autoFocus className="w-full bg-[#121212] border border-orange-500 rounded px-1 text-xs text-white" value={tempLayerName} onChange={(e) => setTempLayerName(e.target.value)}
-                          onBlur={() => updateLayerName(layer.id, tempLayerName)} onKeyDown={(e) => e.key === 'Enter' && updateLayerName(layer.id, tempLayerName)} onClick={e => e.stopPropagation()} /> :
+                        <input autoFocus className="w-full bg-[#121212] border border-orange-500 rounded px-1 text-xs text-white" value={tempLayerName} onChange={(e) => setTempLayerName(e.target.value)} onBlur={() => updateLayerName(layer.id, tempLayerName)} onKeyDown={(e) => e.key === 'Enter' && updateLayerName(layer.id, tempLayerName)} onClick={e => e.stopPropagation()} /> :
                         <div className="text-xs font-bold truncate" onDoubleClick={(e) => { e.stopPropagation(); setEditingLayerId(layer.id); setTempLayerName(layer.name); }}>{layer.name}</div>
                       }
                       <div className="text-[10px] text-gray-500 mt-0.5 uppercase tracking-tighter">{t.layers.blendModes[layer.blendMode]}</div>
@@ -1172,9 +1282,7 @@ const App: React.FC = () => {
                         <span className="text-[9px] uppercase text-gray-500 w-12">{t.brushSettings.opacity}</span>
                         <input type="range" min="0" max="1" step="0.01" value={layer.opacity} onChange={(e) => { layer.opacity = parseFloat(e.target.value); setLayers([...layers]); }} className="flex-1 h-1 bg-[#333] rounded accent-orange-600 appearance-none" />
                       </div>
-                      <select value={layer.blendMode} onChange={(e) => { layer.blendMode = e.target.value as BlendMode; setLayers([...layers]); }} className="w-full bg-[#121212] border border-[#333] rounded p-1 text-[10px]">
-                        {Object.entries(t.layers.blendModes).map(([val, label]) => <option key={val} value={val}>{label}</option>)}
-                      </select>
+                      <select value={layer.blendMode} onChange={(e) => { layer.blendMode = e.target.value as BlendMode; setLayers([...layers]); }} className="w-full bg-[#121212] border border-[#333] rounded p-1 text-[10px]">{Object.entries(t.layers.blendModes).map(([val, label]) => <option key={val} value={val}>{label}</option>)}</select>
                     </div>
                   )}
                 </div>
@@ -1183,32 +1291,16 @@ const App: React.FC = () => {
         </aside>
       </div>
 
-      {/* Context Menu Component */}
       {contextMenu && (
-        <div 
-          className="fixed bg-[#1e1e1e] border border-[#333] rounded-xl shadow-2xl z-[500] py-2 min-w-[200px] animate-in fade-in zoom-in-95"
-          style={{ top: contextMenu.y, left: contextMenu.x }}
-          onClick={e => e.stopPropagation()}
-        >
+        <div className="fixed bg-[#1e1e1e] border border-[#333] rounded-xl shadow-2xl z-[500] py-2 min-w-[200px] animate-in fade-in zoom-in-95" style={{ top: contextMenu.y, left: contextMenu.x }} onClick={e => e.stopPropagation()}>
           {contextMenu.isWorkspace ? (
             <div className="px-1 py-1">
                <h4 className="px-3 py-1 text-[9px] uppercase font-bold text-gray-500 tracking-widest mb-1">{t.contextMenu.workspaceColor}</h4>
-               {[
-                 { label: t.contextMenu.colorBlack, color: '#000000' },
-                 { label: t.contextMenu.colorDarkGray, color: '#1a1a1a' },
-                 { label: t.contextMenu.colorMediumGray, color: '#2b2b2b' },
-                 { label: t.contextMenu.colorLightGray, color: '#444444' },
-               ].map(item => (
-                 <button key={item.color} onClick={() => { setWorkspaceColor(item.color); setContextMenu(null); }} 
-                   className="w-full flex items-center justify-between px-3 py-1.5 text-[11px] hover:bg-orange-600 hover:text-white transition-colors text-left rounded-lg">
-                   <span>{item.label}</span>
-                   <div className="w-3 h-3 rounded-full border border-white/20" style={{ backgroundColor: item.color }} />
-                 </button>
+               {[{ label: t.contextMenu.colorBlack, color: '#000000' }, { label: t.contextMenu.colorDarkGray, color: '#1a1a1a' }, { label: t.contextMenu.colorMediumGray, color: '#2b2b2b' }, { label: t.contextMenu.colorLightGray, color: '#444444' }].map(item => (
+                 <button key={item.color} onClick={() => { setWorkspaceColor(item.color); setContextMenu(null); }} className="w-full flex items-center justify-between px-3 py-1.5 text-[11px] hover:bg-orange-600 hover:text-white transition-colors text-left rounded-lg"><span>{item.label}</span><div className="w-3 h-3 rounded-full border border-white/20" style={{ backgroundColor: item.color }} /></button>
                ))}
                <div className="h-px bg-[#333] my-1" />
-               <button onClick={() => { workspaceColorRef.current?.click(); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-1.5 text-[11px] hover:bg-orange-600 hover:text-white transition-colors text-left rounded-lg">
-                  <Palette size={14}/> {t.contextMenu.colorCustom}
-               </button>
+               <button onClick={() => { workspaceColorRef.current?.click(); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-1.5 text-[11px] hover:bg-orange-600 hover:text-white transition-colors text-left rounded-lg"><Palette size={14}/> {t.contextMenu.colorCustom}</button>
             </div>
           ) : (
             <>
@@ -1222,31 +1314,20 @@ const App: React.FC = () => {
                   <div className="h-px bg-[#333] my-2" />
                   <div className="grid grid-cols-4 gap-2 max-h-40 overflow-y-auto custom-scrollbar p-1">
                     {brushPresets.map(bp => (
-                      <button key={bp.id} onClick={() => { setActiveBrushId(bp.id); setContextMenu(null); }} 
-                        className={`w-full aspect-square rounded border transition-all flex items-center justify-center p-1 ${activeBrushId === bp.id ? 'border-orange-500 bg-orange-500/10' : 'border-[#333] hover:border-gray-500'}`}>
-                        {bp.icon ? <img src={bp.icon} className="w-full h-full object-cover" /> : <Circle size={16} className={activeBrushId === bp.id ? 'text-orange-500' : 'text-gray-500'} />}
+                      <button key={bp.id} onClick={() => { setActiveBrushId(bp.id); setContextMenu(null); }} className={`w-8 h-8 rounded border transition-all flex items-center justify-center p-1 bg-black/40 ${activeBrushId === bp.id ? 'border-orange-500 bg-orange-500/10' : 'border-[#333] hover:border-gray-500'}`}>
+                        {bp.icon ? <img src={bp.icon} className="w-full h-full object-cover" /> : bp.image ? <img src={bp.image.src} className="w-full h-full object-contain" /> : <Circle size={16} className={activeBrushId === bp.id ? 'text-orange-500' : 'text-gray-500'} />}
                       </button>
                     ))}
                   </div>
                 </div>
               ) : activeTool === ToolType.PICKER ? (
-                <div className="px-1 py-1">
-                  <button onClick={() => { navigator.clipboard.writeText(brushColor); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2 text-[11px] hover:bg-orange-600 hover:text-white transition-colors text-left rounded-lg">
-                    <Pipette size={14}/> {t.contextMenu.copyHex}
-                  </button>
-                </div>
+                <div className="px-1 py-1"><button onClick={() => { navigator.clipboard.writeText(brushColor); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2 text-[11px] hover:bg-orange-600 hover:text-white transition-colors text-left rounded-lg"><Pipette size={14}/> {t.contextMenu.copyHex}</button></div>
               ) : (
                 <div className="px-1 py-1">
                   <h4 className="px-3 py-1 text-[9px] uppercase font-bold text-gray-500 tracking-widest mb-1">{t.contextMenu.zoomOptions}</h4>
-                  <button onClick={() => { handleFitScreen(); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2 text-[11px] hover:bg-orange-600 hover:text-white transition-colors text-left rounded-lg">
-                    <Maximize2 size={14}/> {t.contextMenu.fitScreen}
-                  </button>
-                  <button onClick={() => { handleResetZoom(); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2 text-[11px] hover:bg-orange-600 hover:text-white transition-colors text-left rounded-lg">
-                    <Plus size={14}/> {t.contextMenu.actualSize}
-                  </button>
-                  <button onClick={() => { setCanvasOffset({x:0, y:0}); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2 text-[11px] hover:bg-orange-600 hover:text-white transition-colors text-left rounded-lg">
-                    <RotateCw size={14}/> {t.contextMenu.resetView}
-                  </button>
+                  <button onClick={() => { handleFitScreen(); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2 text-[11px] hover:bg-orange-600 hover:text-white transition-colors text-left rounded-lg"><Maximize2 size={14}/> {t.contextMenu.fitScreen}</button>
+                  <button onClick={() => { handleResetZoom(); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2 text-[11px] hover:bg-orange-600 hover:text-white transition-colors text-left rounded-lg"><Plus size={14}/> {t.contextMenu.actualSize}</button>
+                  <button onClick={() => { setCanvasOffset({x:0, y:0}); setContextMenu(null); }} className="w-full flex items-center gap-3 px-3 py-2 text-[11px] hover:bg-orange-600 hover:text-white transition-colors text-left rounded-lg"><RotateCw size={14}/> {t.contextMenu.resetView}</button>
                 </div>
               )}
             </>
@@ -1254,40 +1335,16 @@ const App: React.FC = () => {
         </div>
       )}
 
-      {/* Modals */}
-      {showShortcutsModal && (
-        <ShortcutsModal 
-          t={t} 
-          currentShortcuts={shortcuts} 
-          altForPicker={altForPickerEnabled}
-          onSave={(newShortcuts, newAltForPicker) => {
-            setShortcuts(newShortcuts);
-            setAltForPickerEnabled(newAltForPicker);
-            localStorage.setItem('pm_shortcuts', JSON.stringify(newShortcuts));
-            localStorage.setItem('pm_alt_picker', JSON.stringify(newAltForPicker));
-            setShowShortcutsModal(false);
-          }} 
-          onCancel={() => setShowShortcutsModal(false)}
-        />
-      )}
-
+      {showShortcutsModal && <ShortcutsModal t={t} currentShortcuts={shortcuts} altForPicker={altForPickerEnabled} onSave={(newShortcuts, newAltForPicker) => { setShortcuts(newShortcuts); setAltForPickerEnabled(newAltForPicker); localStorage.setItem('pm_shortcuts', JSON.stringify(newShortcuts)); localStorage.setItem('pm_alt_picker', JSON.stringify(newAltForPicker)); setShowShortcutsModal(false); }} onCancel={() => setShowShortcutsModal(false)} />}
       {showHueSatModal && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
           <div className="bg-[#1e1e1e] border border-[#333] rounded-2xl shadow-2xl max-md w-full p-6 animate-in zoom-in-95" onClick={e => e.stopPropagation()}>
             <div className="flex items-center gap-3 text-orange-500 mb-6"><Sliders size={24} /><h3 className="text-lg font-bold text-gray-100">{t.adjustments.hueSaturation}</h3></div>
-            <div className="space-y-6">
-              <AdjustmentSlider label={t.adjustments.hue} min={-180} max={180} value={hueAdjust} onChange={setHueAdjust} />
-              <AdjustmentSlider label={t.adjustments.saturation} min={-100} max={100} value={satAdjust} onChange={setSatAdjust} />
-              <AdjustmentSlider label={t.adjustments.lightness} min={-100} max={100} value={lightAdjust} onChange={setLightAdjust} />
-            </div>
-            <div className="flex gap-3 mt-8">
-              <button onClick={handleApplyHueSaturation} className="flex-1 bg-orange-600 hover:bg-orange-700 text-white py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all">{t.adjustments.apply}</button>
-              <button onClick={() => setShowHueSatModal(false)} className="flex-1 bg-[#2a2a2a] hover:bg-[#333] text-gray-300 py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all">{t.adjustments.cancel}</button>
-            </div>
+            <div className="space-y-6"><AdjustmentSlider label={t.adjustments.hue} min={-180} max={180} value={hueAdjust} onChange={setHueAdjust} /><AdjustmentSlider label={t.adjustments.saturation} min={-100} max={100} value={satAdjust} onChange={setSatAdjust} /><AdjustmentSlider label={t.adjustments.lightness} min={-100} max={100} value={lightAdjust} onChange={setLightAdjust} /></div>
+            <div className="flex gap-3 mt-8"><button onClick={handleApplyHueSaturation} className="flex-1 bg-orange-600 hover:bg-orange-700 text-white py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all">{t.adjustments.apply}</button><button onClick={() => setShowHueSatModal(false)} className="flex-1 bg-[#2a2a2a] hover:bg-[#333] text-gray-300 py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all">{t.adjustments.cancel}</button></div>
           </div>
         </div>
       )}
-
       {showCanvasSettings && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
           <div className="bg-[#1e1e1e] border border-[#333] rounded-2xl shadow-2xl max-w-sm w-full p-6 animate-in zoom-in-95" onClick={e => e.stopPropagation()}>
@@ -1295,44 +1352,20 @@ const App: React.FC = () => {
             <div className="space-y-4">
               <div className="flex justify-between items-center"><span className="text-xs text-gray-500">{t.canvasSettings.width}</span><input type="number" value={tempCanvasSettings.width} onChange={e => setTempCanvasSettings({...tempCanvasSettings, width: parseInt(e.target.value)||0})} className="bg-black border border-[#333] rounded px-2 py-1 text-xs w-24" /></div>
               <div className="flex justify-between items-center"><span className="text-xs text-gray-500">{t.canvasSettings.height}</span><input type="number" value={tempCanvasSettings.height} onChange={e => setTempCanvasSettings({...tempCanvasSettings, height: parseInt(e.target.value)||0})} className="bg-black border border-[#333] rounded px-2 py-1 text-xs w-24" /></div>
-              <div className="flex justify-between items-center">
-                <span className="text-xs text-gray-500 flex items-center gap-1"><Palette size={12}/> {t.canvasSettings.backgroundColor}</span>
-                <input type="color" value={tempCanvasSettings.bgColor} onChange={e => setTempCanvasSettings({...tempCanvasSettings, bgColor: e.target.value})} className="w-8 h-8 bg-transparent border-none cursor-pointer" />
-              </div>
+              <div className="flex justify-between items-center"><span className="text-xs text-gray-500 flex items-center gap-1"><Palette size={12}/> {t.canvasSettings.backgroundColor}</span><input type="color" value={tempCanvasSettings.bgColor} onChange={e => setTempCanvasSettings({...tempCanvasSettings, bgColor: e.target.value})} className="w-8 h-8 bg-transparent border-none cursor-pointer" /></div>
             </div>
-            <div className="flex gap-2 mt-6">
-              <button onClick={() => setShowResizeConfirm(true)} className="flex-1 bg-orange-600 text-white py-2 rounded text-xs font-bold">{t.canvasSettings.apply}</button>
-              <button onClick={() => setShowCanvasSettings(false)} className="flex-1 bg-[#2a2a2a] text-gray-400 py-2 rounded text-xs font-bold">{t.canvasSettings.cancel}</button>
-            </div>
+            <div className="flex gap-2 mt-6"><button onClick={() => setShowResizeConfirm(true)} className="flex-1 bg-orange-600 text-white py-2 rounded text-xs font-bold">{t.canvasSettings.apply}</button><button onClick={() => setShowCanvasSettings(false)} className="flex-1 bg-[#2a2a2a] text-gray-400 py-2 rounded text-xs font-bold">{t.canvasSettings.cancel}</button></div>
           </div>
         </div>
       )}
-
       {showResizeConfirm && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-[300] flex items-center justify-center p-4">
-          <div className="bg-[#1e1e1e] border border-[#333] rounded-2xl p-6 max-w-xs text-center">
-            <AlertCircle size={32} className="mx-auto text-orange-500 mb-4" />
-            <h4 className="font-bold mb-2">{t.canvasSettings.confirmTitle}</h4>
-            <p className="text-xs text-gray-500 mb-6">{t.canvasSettings.confirmMessage}</p>
-            <div className="flex gap-2">
-              <button onClick={executeResize} className="flex-1 bg-orange-600 text-white py-2 rounded text-xs font-bold">{t.canvasSettings.confirmAction}</button>
-              <button onClick={() => setShowResizeConfirm(false)} className="flex-1 bg-[#2a2a2a] text-gray-400 py-2 rounded text-xs font-bold">{t.canvasSettings.cancelAction}</button>
-            </div>
-          </div>
+          <div className="bg-[#1e1e1e] border border-[#333] rounded-2xl p-6 max-w-xs text-center"><AlertCircle size={32} className="mx-auto text-orange-500 mb-4" /><h4 className="font-bold mb-2">{t.canvasSettings.confirmTitle}</h4><p className="text-xs text-gray-500 mb-6">{t.canvasSettings.confirmMessage}</p><div className="flex gap-2"><button onClick={executeResize} className="flex-1 bg-orange-600 text-white py-2 rounded text-xs font-bold">{t.canvasSettings.confirmAction}</button><button onClick={() => setShowResizeConfirm(false)} className="flex-1 bg-[#2a2a2a] text-gray-400 py-2 rounded text-xs font-bold">{t.canvasSettings.cancelAction}</button></div></div>
         </div>
       )}
-
       {showDeleteLayerConfirm && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-[300] flex items-center justify-center p-4">
-          <div className="bg-[#1e1e1e] border border-[#333] rounded-2xl p-6 max-w-xs text-center animate-in zoom-in-95">
-            <AlertCircle size={32} className="mx-auto text-red-500 mb-4" />
-            <h4 className="font-bold mb-2 text-gray-100">{t.layerSettings.confirmDeleteTitle}</h4>
-            <p className="text-xs text-gray-500 mb-6">{t.layerSettings.confirmDeleteMessage}</p>
-            <div className="flex gap-2">
-              <button onClick={executeRemoveLayer} className="flex-1 bg-red-600 hover:bg-red-700 text-white py-2 rounded text-xs font-bold transition-colors">{t.layerSettings.deleteAction}</button>
-              <button onClick={() => { setShowDeleteLayerConfirm(false); setLayerToDeleteId(null); }} className="flex-1 bg-[#2a2a2a] hover:bg-[#333] text-gray-400 py-2 rounded text-xs font-bold transition-colors">{t.layerSettings.cancelAction}</button>
-            </div>
-          </div>
+          <div className="bg-[#1e1e1e] border border-[#333] rounded-2xl p-6 max-w-xs text-center animate-in zoom-in-95"><AlertCircle size={32} className="mx-auto text-red-500 mb-4" /><h4 className="font-bold mb-2 text-gray-100">{t.layerSettings.confirmDeleteTitle}</h4><p className="text-xs text-gray-500 mb-6">{t.layerSettings.confirmDeleteMessage}</p><div className="flex gap-2"><button onClick={executeRemoveLayer} className="flex-1 bg-red-600 hover:bg-red-700 text-white py-2 rounded text-xs font-bold transition-colors">{t.layerSettings.deleteAction}</button><button onClick={() => { setShowDeleteLayerConfirm(false); setLayerToDeleteId(null); }} className="flex-1 bg-[#2a2a2a] hover:bg-[#333] text-gray-400 py-2 rounded text-xs font-bold transition-colors">{t.layerSettings.cancelAction}</button></div></div>
         </div>
       )}
     </div>
@@ -1340,142 +1373,40 @@ const App: React.FC = () => {
 };
 
 // --- Subcomponents ---
-
 const ShortcutsModal: React.FC<{ t: any, currentShortcuts: ShortcutMap, altForPicker: boolean, onSave: (s: ShortcutMap, a: boolean) => void, onCancel: () => void }> = ({ t, currentShortcuts, altForPicker, onSave, onCancel }) => {
   const [localShortcuts, setLocalShortcuts] = useState<ShortcutMap>({ ...currentShortcuts });
   const [localAltForPicker, setLocalAltForPicker] = useState(altForPicker);
   const [editingAction, setEditingAction] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<'tools' | 'menu'>('tools');
-
-  const categories = [
-    { id: 'tools', label: t.shortcuts.tools, icon: <Palette size={14}/> },
-    { id: 'menu', label: t.shortcuts.application, icon: <Layers size={14}/> }
-  ];
-
+  const categories = [{ id: 'tools', label: t.shortcuts.tools, icon: <Palette size={14}/> }, { id: 'menu', label: t.shortcuts.application, icon: <Layers size={14}/> }];
   const actionsByCat = {
-    tools: [
-      { id: 'TOOL_MOVE', label: t.tools.move },
-      { id: 'TOOL_BRUSH', label: t.tools.brush },
-      { id: 'TOOL_SMUDGE', label: t.tools.smudge },
-      { id: 'TOOL_ERASER', label: t.tools.eraser },
-      { id: 'TOOL_FILL', label: t.tools.fill },
-      { id: 'TOOL_PICKER', label: t.tools.picker },
-      { id: 'TOOL_HAND', label: t.tools.hand },
-    ],
-    menu: [
-      { id: 'MENU_NEW', label: t.menus.items.new },
-      { id: 'MENU_SAVE', label: t.menus.items.save },
-      { id: 'MENU_EXPORT', label: t.menus.items.export },
-      { id: 'ZOOM_IN', label: t.menus.items.zoomIn },
-      { id: 'ZOOM_OUT', label: t.menus.items.zoomOut },
-      { id: 'FIT_SCREEN', label: t.menus.items.fitScreen },
-      { id: 'TOGGLE_RULERS', label: t.menus.items.showRulers },
-    ]
+    tools: [{ id: 'TOOL_MOVE', label: t.tools.move }, { id: 'TOOL_BRUSH', label: t.tools.brush }, { id: 'TOOL_SMUDGE', label: t.tools.smudge }, { id: 'TOOL_ERASER', label: t.tools.eraser }, { id: 'TOOL_FILL', label: t.tools.fill }, { id: 'TOOL_PICKER', label: t.tools.picker }, { id: 'TOOL_HAND', label: t.tools.hand }, { id: 'TOOL_TEXT', label: t.tools.text }],
+    menu: [{ id: 'MENU_NEW', label: t.menus.items.new }, { id: 'UNDO', label: t.menus.items.undo }, { id: 'REDO', label: t.menus.items.redo }, { id: 'MENU_SAVE', label: t.menus.items.save }, { id: 'MENU_EXPORT', label: t.menus.items.export }, { id: 'ZOOM_IN', label: t.menus.items.zoomIn }, { id: 'ZOOM_OUT', label: t.menus.items.zoomOut }, { id: 'FIT_SCREEN', label: t.menus.items.fitScreen }, { id: 'TOGGLE_RULERS', label: t.menus.items.showRulers }, { id: 'DESELECT', label: t.menus.items.deselect }]
   };
-
   const handleKeyDown = (e: KeyboardEvent) => {
-    if (!editingAction) return;
-    e.preventDefault();
-    if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) return;
-
-    const parts = [];
-    if (e.ctrlKey || e.metaKey) parts.push('Control');
-    if (e.altKey) parts.push('Alt');
-    if (e.shiftKey) parts.push('Shift');
-    parts.push(e.key.toLowerCase());
-    const combo = parts.join('+');
-
-    setLocalShortcuts(prev => ({ ...prev, [editingAction]: combo }));
-    setEditingAction(null);
+    if (!editingAction) return; e.preventDefault(); if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) return;
+    const parts = []; if (e.ctrlKey || e.metaKey) parts.push('Control'); if (e.altKey) parts.push('Alt'); if (e.shiftKey) parts.push('Shift');
+    parts.push(e.key.toLowerCase()); const combo = parts.join('+');
+    setLocalShortcuts(prev => ({ ...prev, [editingAction]: combo })); setEditingAction(null);
   };
-
   useEffect(() => {
-    if (editingAction) {
-      window.addEventListener('keydown', handleKeyDown);
-      return () => window.removeEventListener('keydown', handleKeyDown);
-    }
+    if (editingAction) { window.addEventListener('keydown', handleKeyDown); return () => window.removeEventListener('keydown', handleKeyDown); }
   }, [editingAction]);
-
   return (
     <div className="fixed inset-0 bg-black/70 backdrop-blur-md z-[600] flex items-center justify-center p-4">
       <div className="bg-[#1e1e1e] border border-[#333] rounded-3xl shadow-2xl w-full max-w-3xl flex flex-col h-[600px] overflow-hidden animate-in zoom-in-95">
-        <header className="p-6 border-b border-[#2a2a2a] flex justify-between items-center bg-[#252525]">
-          <h2 className="text-lg font-black text-gray-100 uppercase tracking-widest flex items-center gap-2"><Keyboard className="text-orange-500" /> {t.shortcuts.title}</h2>
-          <button onClick={onCancel} className="p-2 hover:bg-[#333] rounded-full transition-colors"><X size={20}/></button>
-        </header>
-
+        <header className="p-6 border-b border-[#2a2a2a] flex justify-between items-center bg-[#252525]"><h2 className="text-lg font-black text-gray-100 uppercase tracking-widest flex items-center gap-2"><Keyboard className="text-orange-500" /> {t.shortcuts.title}</h2><button onClick={onCancel} className="p-2 hover:bg-[#333] rounded-full transition-colors"><X size={20}/></button></header>
         <div className="flex flex-1 overflow-hidden">
-          <aside className="w-52 border-r border-[#2a2a2a] bg-[#1a1a1a] p-2 space-y-1">
-            {categories.map(cat => (
-              <button 
-                key={cat.id} 
-                onClick={() => setActiveCategory(cat.id as any)}
-                className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-xs font-bold transition-all ${activeCategory === cat.id ? 'bg-orange-600 text-white shadow-lg' : 'hover:bg-[#252525] text-gray-400'}`}
-              >
-                {cat.icon} {cat.label}
-              </button>
-            ))}
-          </aside>
-
+          <aside className="w-52 border-r border-[#2a2a2a] bg-[#1a1a1a] p-2 space-y-1">{categories.map(cat => <button key={cat.id} onClick={() => setActiveCategory(cat.id as any)} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-xs font-bold transition-all ${activeCategory === cat.id ? 'bg-orange-600 text-white shadow-lg' : 'hover:bg-[#252525] text-gray-400'}`}>{cat.icon} {cat.label}</button>)}</aside>
           <main className="flex-1 overflow-y-auto custom-scrollbar p-6 bg-[#1e1e1e]">
-            <div className="mb-8 p-4 bg-[#252525] rounded-xl border border-[#333]">
-              <label className="flex items-center gap-3 cursor-pointer">
-                <input 
-                  type="checkbox" 
-                  checked={localAltForPicker} 
-                  onChange={(e) => setLocalAltForPicker(e.target.checked)}
-                  className="w-4 h-4 accent-orange-600"
-                />
-                <span className="text-xs font-bold text-gray-200">{t.shortcuts.altForEyedropper}</span>
-              </label>
-            </div>
-
-            <table className="w-full text-xs text-left">
-              <thead>
-                <tr className="text-gray-500 border-b border-[#333]">
-                  <th className="pb-4 font-black uppercase tracking-widest">{t.shortcuts.command}</th>
-                  <th className="pb-4 font-black uppercase tracking-widest">{t.shortcuts.shortcut}</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[#2a2a2a]">
-                {actionsByCat[activeCategory].map(action => {
-                  const isEditing = editingAction === action.id;
-                  const currentKeys = localShortcuts[action.id] || '';
-                  
-                  // Simple conflict check
-                  const isConflict = Object.entries(localShortcuts).some(([id, combo]) => combo === currentKeys && id !== action.id);
-
-                  return (
-                    <tr key={action.id} className="group hover:bg-black/10">
-                      <td className="py-4 text-gray-300 font-medium">{action.label}</td>
-                      <td className="py-4">
-                        <button 
-                          onClick={() => setEditingAction(action.id)}
-                          className={`min-w-[120px] px-3 py-2 rounded-lg border text-center font-mono transition-all ${
-                            isEditing ? 'bg-orange-600/20 border-orange-500 text-orange-500 shadow-inner' : 
-                            isConflict ? 'border-red-500/50 bg-red-500/10 text-red-500' :
-                            'border-[#333] bg-[#252525] group-hover:border-[#444] text-gray-400'
-                          }`}
-                        >
-                          {isEditing ? t.shortcuts.pressKey : currentKeys || '—'}
-                        </button>
-                        {isConflict && !isEditing && <span className="ml-2 text-[10px] text-red-500 opacity-60">{t.shortcuts.conflict}</span>}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+            <div className="mb-8 p-4 bg-[#252525] rounded-xl border border-[#333]"><label className="flex items-center gap-3 cursor-pointer"><input type="checkbox" checked={localAltForPicker} onChange={(e) => setLocalAltForPicker(e.target.checked)} className="w-4 h-4 accent-orange-600" /><span className="text-xs font-bold text-gray-200">{t.shortcuts.altForEyedropper}</span></label></div>
+            <table className="w-full text-xs text-left"><thead><tr className="text-gray-500 border-b border-[#333]"><th className="pb-4 font-black uppercase tracking-widest">{t.shortcuts.command}</th><th className="pb-4 font-black uppercase tracking-widest">{t.shortcuts.shortcut}</th></tr></thead><tbody className="divide-y divide-[#2a2a2a]">{actionsByCat[activeCategory].map(action => {
+              const isEditing = editingAction === action.id; const currentKeys = localShortcuts[action.id] || ''; const isConflict = Object.entries(localShortcuts).some(([id, combo]) => combo === currentKeys && id !== action.id);
+              return (<tr key={action.id} className="group hover:bg-black/10"><td className="py-4 text-gray-300 font-medium">{action.label}</td><td className="py-4"><button onClick={() => setEditingAction(action.id)} className={`min-w-[120px] px-3 py-2 rounded-lg border text-center font-mono transition-all ${isEditing ? t.shortcuts.pressKey : currentKeys || '—'}`}>{isEditing ? t.shortcuts.pressKey : currentKeys || '—'}</button>{isConflict && !isEditing && <span className="ml-2 text-[10px] text-red-500 opacity-60">{t.shortcuts.conflict}</span>}</td></tr>);
+            })}</tbody></table>
           </main>
         </div>
-
-        <footer className="p-6 border-t border-[#2a2a2a] bg-[#252525] flex justify-between items-center">
-           <button onClick={() => { setLocalShortcuts(DEFAULT_SHORTCUTS); setLocalAltForPicker(true); }} className="text-xs text-gray-500 hover:text-orange-500 font-bold uppercase transition-colors">{t.shortcuts.reset}</button>
-           <div className="flex gap-3">
-              <button onClick={onCancel} className="px-6 py-2.5 rounded-xl bg-[#333] hover:bg-[#444] text-xs font-bold transition-all">{t.shortcuts.cancel}</button>
-              <button onClick={() => onSave(localShortcuts, localAltForPicker)} className="px-8 py-2.5 rounded-xl bg-orange-600 hover:bg-orange-700 text-white text-xs font-bold shadow-lg active:scale-95 transition-all">{t.shortcuts.save}</button>
-           </div>
-        </footer>
+        <footer className="p-6 border-t border-[#2a2a2a] bg-[#252525] flex justify-between items-center"><button onClick={() => { setLocalShortcuts(DEFAULT_SHORTCUTS); setLocalAltForPicker(true); }} className="text-xs text-gray-500 hover:text-orange-500 font-bold uppercase transition-colors">{t.shortcuts.reset}</button><div className="flex gap-3"><button onClick={onCancel} className="px-6 py-2.5 rounded-xl bg-[#333] hover:bg-[#444] text-xs font-bold transition-all">{t.shortcuts.cancel}</button><button onClick={() => onSave(localShortcuts, localAltForPicker)} className="px-8 py-2.5 rounded-xl bg-orange-600 hover:bg-orange-700 text-white text-xs font-bold shadow-lg active:scale-95 transition-all">{t.shortcuts.save}</button></div></footer>
       </div>
     </div>
   );
@@ -1485,50 +1416,21 @@ const Ruler: React.FC<{ orientation: 'horizontal' | 'vertical', size: number, zo
   const canvasRef = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
     if (!canvasRef.current) return;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d')!;
-    const dpr = window.devicePixelRatio || 1;
-    const rect = canvas.getBoundingClientRect();
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
-    ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, rect.width, rect.height);
-    ctx.fillStyle = '#888';
-    ctx.font = '9px monospace';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.strokeStyle = '#444';
-    const isH = orientation === 'horizontal';
-    const contentDim = isH ? rect.width : rect.height;
-    const center = contentDim / 2 + offset;
-    const startCanvasPixel = -center / zoom;
-    const endCanvasPixel = (contentDim - center) / zoom;
-    const baseIntervals = [1, 5, 10, 50, 100, 500, 1000, 5000];
-    let interval = 100;
-    for (const b of baseIntervals) {
-      if (b * zoom >= 50) { interval = b; break; }
-    }
-    const startVal = Math.floor(startCanvasPixel / interval) * interval;
-    const endVal = Math.ceil(endCanvasPixel / interval) * interval;
+    const canvas = canvasRef.current; const ctx = canvas.getContext('2d')!; const dpr = window.devicePixelRatio || 1; const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr; canvas.height = rect.height * dpr; ctx.scale(dpr, dpr); ctx.clearRect(0, 0, rect.width, rect.height); ctx.fillStyle = '#888'; ctx.font = '9px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.strokeStyle = '#444';
+    const isH = orientation === 'horizontal'; const contentDim = isH ? rect.width : rect.height; const center = contentDim / 2 + offset;
+    const startCanvasPixel = -center / zoom; const endCanvasPixel = (contentDim - center) / zoom;
+    const baseIntervals = [1, 5, 10, 50, 100, 500, 1000, 5000]; let interval = 100;
+    for (const b of baseIntervals) { if (b * zoom >= 50) { interval = b; break; } }
+    const startVal = Math.floor(startCanvasPixel / interval) * interval; const endVal = Math.ceil(endCanvasPixel / interval) * interval;
     for (let val = startVal; val <= endVal; val += interval) {
-      const pos = val * zoom + center;
-      if (pos < 0 || pos > contentDim) continue;
-      if (isH) {
-        ctx.beginPath(); ctx.moveTo(pos, 10); ctx.lineTo(pos, 20); ctx.stroke();
-        ctx.fillText(val.toString(), pos, 5);
-      } else {
-        ctx.save(); ctx.translate(5, pos); ctx.rotate(-Math.PI / 2); ctx.fillText(val.toString(), 0, 0); ctx.restore();
-        ctx.beginPath(); ctx.moveTo(10, pos); ctx.lineTo(20, pos); ctx.stroke();
-      }
+      const pos = val * zoom + center; if (pos < 0 || pos > contentDim) continue;
+      if (isH) { ctx.beginPath(); ctx.moveTo(pos, 10); ctx.lineTo(pos, 20); ctx.stroke(); ctx.fillText(val.toString(), pos, 5); } 
+      else { ctx.save(); ctx.translate(5, pos); ctx.rotate(-Math.PI / 2); ctx.fillText(val.toString(), 0, 0); ctx.restore(); ctx.beginPath(); ctx.moveTo(10, pos); ctx.lineTo(20, pos); ctx.stroke(); }
       const subInterval = interval / 5;
       for (let s = 1; s < 5; s++) {
-        const subVal = val + s * subInterval;
-        const subPos = subVal * zoom + center;
-        if (subPos < 0 || subPos > contentDim) continue;
-        ctx.beginPath();
-        if (isH) { ctx.moveTo(subPos, 15); ctx.lineTo(subPos, 20); }
-        else { ctx.moveTo(15, subPos); ctx.lineTo(20, subPos); }
-        ctx.stroke();
+        const subVal = val + s * subInterval; const subPos = subVal * zoom + center; if (subPos < 0 || subPos > contentDim) continue;
+        ctx.beginPath(); if (isH) { ctx.moveTo(subPos, 15); ctx.lineTo(subPos, 20); } else { ctx.moveTo(15, subPos); ctx.lineTo(20, subPos); } ctx.stroke();
       }
     }
   }, [orientation, size, zoom, offset]);
@@ -1536,18 +1438,11 @@ const Ruler: React.FC<{ orientation: 'horizontal' | 'vertical', size: number, zo
 };
 
 const HeaderControl: React.FC<{ label: string, min: number, max: number, value: number, onChange: (v: number) => void, step?: number, percentage?: boolean }> = ({ label, min, max, value, onChange, step = 1, percentage }) => (
-  <div className="flex items-center gap-2">
-    <span className="text-[9px] uppercase text-gray-500 font-bold">{label}</span>
-    <input type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(parseFloat(e.target.value))} className="w-20 h-1 bg-[#333] rounded accent-orange-600 appearance-none" />
-    <span className="text-[10px] font-mono text-gray-400 w-8">{percentage ? Math.round(value * 100) + '%' : value}</span>
-  </div>
+  <div className="flex items-center gap-2"><span className="text-[9px] uppercase text-gray-500 font-bold">{label}</span><input type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(parseFloat(e.target.value))} className="w-20 h-1 bg-[#333] rounded accent-orange-600 appearance-none" /><span className="text-[10px] font-mono text-gray-400 w-8">{percentage ? Math.round(value * 100) + '%' : value}</span></div>
 );
 
 const ToolButton: React.FC<{ icon: React.ReactNode, active: boolean, onClick: () => void, label: string }> = ({ icon, active, onClick, label }) => (
-  <button onClick={onClick} className={`p-3 rounded-2xl transition-all relative group ${active ? 'bg-orange-600 text-white shadow-xl scale-110 z-10' : 'hover:bg-[#2a2a2a] text-gray-400'}`} title={label}>
-    {icon}
-    <div className="absolute left-full ml-4 bg-black/90 text-white text-[10px] px-3 py-1.5 rounded-lg opacity-0 group-hover:opacity-100 pointer-events-none whitespace-nowrap transition-all border border-white/10 z-[100]">{label}</div>
-  </button>
+  <button onClick={onClick} className={`p-3 rounded-2xl transition-all relative group ${active ? 'bg-orange-600 text-white shadow-xl scale-110 z-10' : 'hover:bg-[#2a2a2a] text-gray-400'}`} title={label}>{icon}<div className="absolute left-full ml-4 bg-black/90 text-white text-[10px] px-3 py-1.5 rounded-lg opacity-0 group-hover:opacity-100 pointer-events-none whitespace-nowrap transition-all border border-white/10 z-[100]">{label}</div></button>
 );
 
 const CanvasLayer: React.FC<{ layer: Layer, previewFilter?: string }> = ({ layer, previewFilter }) => {
@@ -1557,18 +1452,12 @@ const CanvasLayer: React.FC<{ layer: Layer, previewFilter?: string }> = ({ layer
     const ctx = canvasRef.current.getContext('2d')!;
     const update = () => {
       ctx.clearRect(0, 0, layer.canvas.width, layer.canvas.height);
-      ctx.globalAlpha = layer.opacity;
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.drawImage(layer.canvas, 0, 0);
+      ctx.globalAlpha = layer.opacity; ctx.globalCompositeOperation = 'source-over'; ctx.drawImage(layer.canvas, 0, 0);
       requestAnimationFrame(update);
     };
-    const anim = requestAnimationFrame(update);
-    return () => cancelAnimationFrame(anim);
+    const anim = requestAnimationFrame(update); return () => cancelAnimationFrame(anim);
   }, [layer.canvas]);
-  return (
-    <canvas ref={canvasRef} width={layer.canvas.width} height={layer.canvas.height} style={{ filter: previewFilter, mixBlendMode: layer.blendMode as any }}
-      className={`absolute inset-0 pointer-events-none ${!layer.visible ? 'hidden' : ''}`} />
-  );
+  return <canvas ref={canvasRef} width={layer.canvas.width} height={layer.canvas.height} style={{ filter: previewFilter, mixBlendMode: layer.blendMode as any }} className={`absolute inset-0 pointer-events-none ${!layer.visible ? 'hidden' : ''}`} />;
 };
 
 const Thumbnail: React.FC<{ canvas: HTMLCanvasElement }> = ({ canvas }) => {
@@ -1576,9 +1465,7 @@ const Thumbnail: React.FC<{ canvas: HTMLCanvasElement }> = ({ canvas }) => {
   useEffect(() => {
     const update = () => {
       if (!thumbRef.current) return;
-      const ctx = thumbRef.current.getContext('2d')!;
-      ctx.clearRect(0, 0, 100, 100);
-      ctx.drawImage(canvas, 0, 0, 100, 100);
+      const ctx = thumbRef.current.getContext('2d')!; ctx.clearRect(0, 0, 100, 100); ctx.drawImage(canvas, 0, 0, 100, 100);
       setTimeout(update, 1000);
     };
     update();
@@ -1587,18 +1474,11 @@ const Thumbnail: React.FC<{ canvas: HTMLCanvasElement }> = ({ canvas }) => {
 };
 
 const ZoomOverlay: React.FC<{ zoom: number, onZoomIn: () => void, onZoomOut: () => void, onReset: () => void }> = ({ zoom, onZoomIn, onZoomOut, onReset }) => (
-  <div className="absolute bottom-6 right-6 flex items-center bg-[#1e1e1e]/80 backdrop-blur border border-[#333] rounded-full p-1 shadow-xl z-50">
-    <button onClick={onZoomOut} className="p-1.5 hover:bg-[#333] rounded-full transition-colors text-gray-400 hover:text-white"><Minus size={14} /></button>
-    <button onClick={onReset} className="px-2 py-1 text-[9px] font-mono hover:bg-[#333] rounded-lg min-w-[50px] text-center">{(zoom * 100).toFixed(0)}%</button>
-    <button onClick={onZoomIn} className="p-1.5 hover:bg-[#333] rounded-full transition-colors text-gray-400 hover:text-white"><Plus size={14} /></button>
-  </div>
+  <div className="absolute bottom-6 right-6 flex items-center bg-[#1e1e1e]/80 backdrop-blur border border-[#333] rounded-full p-1 shadow-xl z-50"><button onClick={onZoomOut} className="p-1.5 hover:bg-[#333] rounded-full transition-colors text-gray-400 hover:text-white"><Minus size={14} /></button><button onClick={onReset} className="px-2 py-1 text-[9px] font-mono hover:bg-[#333] rounded-lg min-w-[50px] text-center">{(zoom * 100).toFixed(0)}%</button><button onClick={onZoomIn} className="p-1.5 hover:bg-[#333] rounded-full transition-colors text-gray-400 hover:text-white"><Plus size={14} /></button></div>
 );
 
 const AdjustmentSlider: React.FC<{ label: string, min: number, max: number, value: number, onChange: (v: number) => void, step?: number, percentage?: boolean }> = ({ label, min, max, value, onChange, step = 1, percentage }) => (
-  <div className="space-y-2">
-    <div className="flex justify-between text-[10px] uppercase font-bold tracking-wider text-gray-500"><span>{label}</span><span className="font-mono text-gray-300">{percentage ? Math.round(value*100) + '%' : value}</span></div>
-    <input type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(parseFloat(e.target.value))} className="w-full h-1.5 bg-[#333] rounded-lg appearance-none accent-orange-600" />
-  </div>
+  <div className="space-y-2"><div className="flex justify-between text-[10px] uppercase font-bold tracking-wider text-gray-500"><span>{label}</span><span className="font-mono text-gray-300">{percentage ? Math.round(value*100) + '%' : value}</span></div><input type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(parseFloat(e.target.value))} className="w-full h-1.5 bg-[#333] rounded-lg appearance-none accent-orange-600" /></div>
 );
 
 export default App;

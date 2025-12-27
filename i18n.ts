@@ -70,7 +70,13 @@ export const translations = {
       picker: 'Color Picker',
       hand: 'Hand Tool',
       aiMagic: 'AI Magic',
-      export: 'Export'
+      export: 'Export',
+      text: 'Text Tool',
+      selectRect: 'Rectangular Marquee',
+      selectEllipse: 'Elliptical Marquee',
+      selectLasso: 'Lasso Tool',
+      selectPolyLasso: 'Polygonal Lasso',
+      selectWand: 'Magic Wand'
     },
     brushSettings: {
       title: 'Brush Settings',
@@ -79,6 +85,7 @@ export const translations = {
       smoothing: 'Smoothing',
       spacing: 'Spacing',
       hardness: 'Hardness',
+      rotation: 'Rotation',
       library: 'Brush Library',
       import: 'Import .ABR / Image',
       tolerance: 'Tolerance',
@@ -88,7 +95,11 @@ export const translations = {
       moveDown: 'Down',
       changeIcon: 'Icon',
       currentColor: 'Current Color',
-      strength: 'Strength'
+      strength: 'Strength',
+      fontSize: 'Font Size',
+      fontFamily: 'Font',
+      textPlaceholder: 'Type your text...',
+      searchPlaceholder: 'Search brushes...'
     },
     canvasSettings: {
       title: 'Canvas Settings',
@@ -230,7 +241,13 @@ export const translations = {
       picker: '吸管工具',
       hand: '抓手工具',
       aiMagic: 'AI 魔法',
-      export: '导出'
+      export: '导出',
+      text: '文字工具',
+      selectRect: '矩形框选',
+      selectEllipse: '椭圆框选',
+      selectLasso: '套索工具',
+      selectPolyLasso: '多边形套索',
+      selectWand: '魔术棒'
     },
     brushSettings: {
       title: '画笔设置',
@@ -239,6 +256,7 @@ export const translations = {
       smoothing: '平滑度',
       spacing: '间距',
       hardness: '硬度',
+      rotation: '旋转',
       library: '笔刷库',
       import: '导入 .ABR / 图片',
       tolerance: '容差',
@@ -248,7 +266,11 @@ export const translations = {
       moveDown: '下移',
       changeIcon: '图标',
       currentColor: '当前颜色',
-      strength: '强度'
+      strength: '强度',
+      fontSize: '字号',
+      fontFamily: '字体',
+      textPlaceholder: '输入文字...',
+      searchPlaceholder: '搜索笔刷...'
     },
     canvasSettings: {
       title: '画布设置',

@@ -2,13 +2,18 @@
 export enum ToolType {
   BRUSH = 'BRUSH',
   ERASER = 'ERASER',
-  SELECT = 'SELECT',
+  SELECT_RECT = 'SELECT_RECT',
+  SELECT_ELLIPSE = 'SELECT_ELLIPSE',
+  SELECT_LASSO = 'SELECT_LASSO',
+  SELECT_POLY_LASSO = 'SELECT_POLY_LASSO',
+  SELECT_WAND = 'SELECT_WAND',
   MOVE = 'MOVE',
   HAND = 'HAND',
   FILL = 'FILL',
   PICKER = 'PICKER',
   AI_EDIT = 'AI_EDIT',
-  SMUDGE = 'SMUDGE'
+  SMUDGE = 'SMUDGE',
+  TEXT = 'TEXT'
 }
 
 export type BlendMode = 'source-over' | 'multiply' | 'screen' | 'overlay' | 'darken' | 'lighten' | 'color-dodge' | 'color-burn';
@@ -33,6 +38,14 @@ export interface Layer {
   blendMode: BlendMode;
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
+  textData?: {
+    content: string;
+    fontSize: number;
+    fontFamily: string;
+    color: string;
+    x: number;
+    y: number;
+  };
 }
 
 export interface EditorState {
