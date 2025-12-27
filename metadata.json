@@ -1,0 +1,7 @@
+{
+  "name": "Photo Monkey",
+  "description": "A professional-grade, AI-powered image editor with pressure-sensitive drawing, layer management, and advanced Gemini-driven image generation and editing.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
