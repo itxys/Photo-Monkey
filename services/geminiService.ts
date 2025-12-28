@@ -75,8 +75,7 @@ export class GeminiService {
    */
   async editImage(base64Image: string, prompt: string): Promise<string | null> {
     try {
-      // Fix: Follow guidelines for GoogleGenAI initialization by using process.env.API_KEY directly
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const ai = new GoogleGenAI({ apiKey: import.meta.env.GEMINI_API_KEY });
       // Downscale to prevent "Rpc failed due to xhr error" which often occurs with large payloads
       const { data, mimeType } = await this.downscaleImage(base64Image);
 
